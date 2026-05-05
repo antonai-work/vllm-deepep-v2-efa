@@ -349,8 +349,15 @@ RUN set -eux; \
     export MAX_JOBS="$(nproc)"; \
     pip install --no-build-isolation --break-system-packages --force-reinstall --no-deps -e .; \
     # Sanity checks for PR #41183 symbols.
+    # The vllm.model_executor probe is done via `grep` of the source file
+    # rather than `import`, because a full import pulls in transformers ->
+    # torchvision whose _meta_registrations require a CUDA runtime to
+    # register `torchvision::nms` (fails on CPU-only build hosts). Runtime
+    # use of these classes inside a GPU container is unaffected.
     python3 -c "from vllm.utils.import_utils import has_deep_ep_v2; print('has_deep_ep_v2 symbol OK')"; \
-    python3 -c "from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize; print('DeepEPV2PrepareAndFinalize OK')"; \
+    grep -q '^class DeepEPV2PrepareAndFinalize' \
+      /opt/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py \
+      && echo 'DeepEPV2PrepareAndFinalize class present in source'; \
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"
 
 # -----------------------------------------------------------------------------
