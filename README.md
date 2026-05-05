@@ -3,6 +3,8 @@
 **Reproducible DeepEP V2 MoE inference with vLLM on AWS EFA, built from
 vanilla upstream sources + one open vLLM PR + one open DeepEP PR.**
 
+**Status:** Dual-path Dockerfile verified locally 2026-05-05 (fast via GHCR base + vanilla inline); CodeBuild CI configured; 24-token chat completion validated on 2× p5.48xlarge H100 with DP=16 EP=16.
+
 This repo packages a complete multi-stage Docker build chain and a
 Kubernetes manifest that produces a working Qwen3-30B-A3B-FP8 MoE
 serving stack on 2x p5.48xlarge (or p5en.48xlarge) H100/H200 nodes
@@ -12,13 +14,15 @@ over AWS EFA. The core path goes vanilla
 fork pin) and produces a real `/v1/chat/completions` response over
 NCCL Gin + EFA, with no V1-to-V2 compat shim in the serving path.
 
-Base image: [`antonai-work/deepep-v2-efa-base`](https://github.com/antonai-work/deepep-v2-efa-base)
-publishes the `ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a`
-image this repo's fast build path consumes.
+## Sibling repos (reproducibility triad)
 
-Companion repo for training:
-[`antonai-work/nemo-rl-deepep-v2-efa`](https://github.com/antonai-work/nemo-rl-deepep-v2-efa)
-uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
+| Repo | Purpose | Status |
+|---|---|---|
+| [deepep-v2-efa-base](https://github.com/antonai-work/deepep-v2-efa-base) | Base substrate (EFA + NCCL + DeepEP V2) | v0.1.0-sm90a released |
+| [nemo-rl-deepep-v2-efa](https://github.com/antonai-work/nemo-rl-deepep-v2-efa) | Training stack (Megatron-LM + NeMo-RL) | Dual-path build verified |
+| [vllm-deepep-v2-efa](https://github.com/antonai-work/vllm-deepep-v2-efa) | Inference stack (this repo) | Dual-path build verified |
+
+Together, these three repos provide end-to-end DeepEP V2 MoE reproducibility on AWS EFA, from base substrate through training and inference.
 
 ## What's inside
 
@@ -56,28 +60,19 @@ uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
   CodeBuild pipeline that builds both modes, runs preflight in each
   image, and pushes the fast build to ECR.
 
-## Upstream
+## Upstream PRs
 
-Two PRs are what this repo ships against directly, plus cross-links
-to PRs filed on the four sibling frameworks that share the same
-DeepEP V2 + EFA substrate. All are open and tracked live in
-`docs/UPSTREAM-STATUS.md`.
+Five PRs filed 2026-04-28 through 2026-05-05, covering the full training + inference stack. All five are independent, EFA-specific, and safe on non-EFA fabrics:
 
-| Upstream repo | PR | Role for this repo | Status |
+| Upstream repo | PR | Status (2026-05-05) | Applies to |
 |---|---|---|---|
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | Primary - adds native DeepEP V2 all2all backend. Augmented with our 2-node EFA traffic + 24-token chat-completion evidence. | OPEN, actively reviewed |
-| [`deepseek-ai/DeepEP`](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | Required - 3 EFA patches in `patches/0001-0003` (auto-QP cap, get_rdma_gbs fast path, scaleout interval). | OPEN, 3 commits |
+| [deepseek-ai/DeepEP](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN, rebased 2026-05-05 | Base substrate (all frameworks) |
+| [vllm-project/vllm](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN, actively reviewed | Inference (this repo) |
+| [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) | [#4632](https://github.com/NVIDIA/Megatron-LM/pull/4632) | DRAFT | Training (sibling repo) |
+| [NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) | [#2410](https://github.com/NVIDIA-NeMo/RL/pull/2410) / [#2411](https://github.com/NVIDIA-NeMo/RL/pull/2411) | DRAFT | Training (sibling repo) |
+| [sgl-project/sglang](https://github.com/sgl-project/sglang) | [#24443](https://github.com/sgl-project/sglang/pull/24443) | DRAFT | Inference (this repo) |
 
-Cross-framework companion PRs (same substrate, different engines):
-
-| Upstream repo | PR | Framework |
-|---|---|---|
-| [`NVIDIA/Megatron-LM`](https://github.com/NVIDIA/Megatron-LM) | [#4632](https://github.com/NVIDIA/Megatron-LM/pull/4632) | DeepEP V2 MoE for Megatron training |
-| [`NVIDIA/NeMo-RL`](https://github.com/NVIDIA/NeMo-RL) | [#2410](https://github.com/NVIDIA/NeMo-RL/pull/2410) / [#2411](https://github.com/NVIDIA/NeMo-RL/pull/2411) | NeMo-RL DeepEP V2 + EFA hooks |
-| [`sgl-project/sglang`](https://github.com/sgl-project/sglang) | [#24443](https://github.com/sgl-project/sglang/pull/24443) | SGLang DeepEP V2 inference path |
-
-When vLLM #41183 and DeepEP #612 merge upstream, this repo's build
-chain reduces to vanilla clones with no patches.
+This repo consumes DeepEP PR #612 as `patches/0001-0003` and vLLM PR #41183 via fork pin. When both PRs merge upstream, this repo's build chain reduces to vanilla clones with no patches. See `docs/UPSTREAM-STATUS.md` for live tracking.
 
 ## Quick start
 
@@ -239,27 +234,14 @@ covered in `docs/DEEPEP-BENCHMARKS.md`, including 2-pod
 (`EP_EFA_MAX_QPS=2`, `EP_EFA_RDMA_GBS=25.0`,
 `OFI_NCCL_GIN_MAX_REQUESTS=512`), and how to read the output.
 
-## Continuous integration
+## CI/CD
 
-An AWS CodeBuild pipeline builds both modes, runs the in-image
-preflight gate, and pushes the fast build to ECR. See
-[`ci/CODEBUILD-SETUP.md`](ci/CODEBUILD-SETUP.md) for IAM role, ECR
-repo, Secrets Manager (for the optional GHCR `read:packages` token),
-and `aws codebuild create-project` templates. The buildspec itself
-lives at [`ci/buildspec.yml`](ci/buildspec.yml).
+Two build pipelines available:
 
-The pipeline:
+- **GitHub Actions** (if configured): `.github/workflows/` for public GHCR push
+- **AWS CodeBuild**: `ci/buildspec.yml` + setup guide in [`ci/CODEBUILD-SETUP.md`](ci/CODEBUILD-SETUP.md)
 
-1. `docker build --build-arg BUILD_MODE=fast` -> runs
-   `/opt/docker/preflight.sh`, must print `8/8 checks PASS` and exit
-   0, then `docker push` to `<acct>.dkr.ecr.<region>.amazonaws.com/vllm-deepep-v2-efa:fast-<sha>`.
-2. `docker build --build-arg BUILD_MODE=vanilla` -> runs the same
-   preflight gate as a validation-only build (not pushed). Proves the
-   repo is offline-reproducible from `nvidia/cuda:12.9.0-devel-ubuntu24.04`
-   without GHCR.
-
-All account IDs, regions, and secret ARNs are CodeBuild environment
-variables; nothing is hardcoded in the checked-in files.
+Both pipelines build fast + vanilla modes, run `docker/preflight.sh` (8/8 checks for this repo), and push the fast tag to registry. All account IDs, regions, and secret ARNs are environment variables; nothing is hardcoded.
 
 ## Why a separate public repo?
 
@@ -283,19 +265,15 @@ validated stack today.
 
 ## Validation
 
-Full cross-framework verbatim evidence (marker counts, curl
-responses, activation log lines, EFA counter deltas, image digests,
-SHA-256 hashes of raw log chunks) is inlined in
-[`docs/VALIDATION-EVIDENCE.md`](docs/VALIDATION-EVIDENCE.md). This
-covers vLLM Run #10 (real 24-token Qwen3-30B-A3B-FP8 chat completion
-on DP=16 EP=16) and TRT-LLM Run #5 (DeepEP fast-path activation
-closing the `enable_attention_dp` gate, 4x512 tokens, 4.58 GB EFA
-TX).
+Cross-framework evidence (2-node EFA traffic, NCCL init markers, DeepEP dispatch+combine latencies, chat completions) is documented across the three repos:
 
-Training-side evidence (Megatron-LM, NeMo-RL, SGLang) is in the
-sibling repo
-[`antonai-work/nemo-rl-deepep-v2-efa`](https://github.com/antonai-work/nemo-rl-deepep-v2-efa)
-under the same filename.
+| Document | Coverage |
+|---|---|
+| [VALIDATION-EVIDENCE.md](docs/VALIDATION-EVIDENCE.md) | Per-framework E2E proofs (vLLM 24-token chat completion, TRT-LLM 4×512 tokens, etc.) |
+| [EFA-TRAFFIC-EVIDENCE.md](docs/EFA-TRAFFIC-EVIDENCE.md) | Hardware-counter proof of MoE traffic over EFA (not NVLink), aggregated across all frameworks |
+| [DEEPEP-BENCHMARKS.md](docs/DEEPEP-BENCHMARKS.md) | Microbenchmark guide (D+C latency ~930 us H100 / ~740 us H200, low-latency kernel, output interpretation) |
+
+Training-side evidence (Megatron-LM, NeMo-RL) is in the sibling repo [`antonai-work/nemo-rl-deepep-v2-efa`](https://github.com/antonai-work/nemo-rl-deepep-v2-efa) under the same filenames.
 
 ## License
 
@@ -305,12 +283,10 @@ upstream repositories (Apache 2.0 for `deepseek-ai/DeepEP` and
 
 ## Related repos and references
 
+- Sibling base repo: https://github.com/antonai-work/deepep-v2-efa-base
+- Sibling training repo: https://github.com/antonai-work/nemo-rl-deepep-v2-efa
 - Upstream DeepEP V2: https://github.com/deepseek-ai/DeepEP
 - Upstream vLLM: https://github.com/vllm-project/vllm
-- vLLM DeepEP V2 PR: https://github.com/vllm-project/vllm/pull/41183
-- DeepEP V2 release PR: https://github.com/deepseek-ai/DeepEP/pull/605
+- Upstream SGLang: https://github.com/sgl-project/sglang
 - AWS EFA installer: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html
 - aws-ofi-nccl: https://github.com/aws/aws-ofi-nccl
-- aws-ofi-nccl GIN fix: https://github.com/aws/aws-ofi-nccl/commit/6e504db
-- Companion training repo:
-  https://github.com/antonai-work/nemo-rl-deepep-v2-efa
