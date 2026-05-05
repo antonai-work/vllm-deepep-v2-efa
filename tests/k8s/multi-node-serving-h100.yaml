@@ -1,0 +1,214 @@
+# 2-pod H100 p5.48xlarge vllm-deepep-v2-efa serving StatefulSet.
+# Namespace: vllm-deepep-v2-efa (isolated).
+# Image: REPLACE_WITH_YOUR_REGISTRY/vllm-deepep-v2-efa:<tag> (see docker/Dockerfile).
+#
+# Goal: prove the two upstream PRs (DeepEP PR #612 + vLLM PR #41183) compose
+#       into a working `vllm serve` stack on AWS EFA, WITHOUT the V1->V2 shim.
+#
+# Env invariants (validated at preflight):
+#   - DEEP_EP_USE_V2_SHIM=0
+#   - /opt/api-shim does NOT exist
+#   - has_deep_ep_v2() = True (PR #41183 probe)
+#   - DeepEPV2PrepareAndFinalize importable (PR #41183 class)
+#   - libnccl-net-ofi.so on ldconfig path
+#
+# Works on ml.p5.48xlarge (HyperPod) and p5.48xlarge (vanilla EKS).
+# For p5en.48xlarge (H200), change node.kubernetes.io/instance-type below.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-deepep-v2-efa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-deepep-v2-efa-headless
+  namespace: vllm-deepep-v2-efa
+spec:
+  clusterIP: None
+  selector:
+    app: vllm-deepep-v2
+  ports:
+    - name: torch
+      port: 29500
+      targetPort: 29500
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm-deepep-v2
+  namespace: vllm-deepep-v2-efa
+spec:
+  serviceName: vllm-deepep-v2-efa-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: vllm-deepep-v2
+  template:
+    metadata:
+      labels:
+        app: vllm-deepep-v2
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+      # HyperPod p5 nodes advertise ml.p5.48xlarge; vanilla EKS with
+      # the EFA device plugin advertises p5.48xlarge. Pick the one your
+      # cluster reports.
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.p5.48xlarge
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: vpc.amazonaws.com/efa
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: vllm-deepep-v2
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          # Replace with your own registry path after building via
+          # docker/build.sh. Example format:
+          #   <account>.dkr.ecr.<region>.amazonaws.com/vllm-deepep-v2-efa:<tag>
+          #   ghcr.io/<org>/vllm-deepep-v2-efa:<tag>
+          image: REPLACE_WITH_YOUR_REGISTRY/vllm-deepep-v2-efa:latest
+          imagePullPolicy: IfNotPresent
+          # Pods stay up as a sleeping container; operators kubectl exec in to
+          # run /opt/tests/serve_chat_completion.sh with ROLE=leader|worker.
+          command: ["sleep", "infinity"]
+          env:
+            # Shim invariants (image already has these baked in; repeat for
+            # visibility in `kubectl describe pod`).
+            - name: DEEP_EP_USE_V2_SHIM
+              value: "0"
+            - name: PYTHONPATH
+              value: /opt/vllm
+
+            # PR #41183 env knobs - defaults chosen to match the upstream PR
+            # default behavior.
+            - name: VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE
+              value: "1"
+            - name: VLLM_DEEPEP_V2_PREFER_OVERLAP
+              value: "0"
+            - name: VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION
+              value: "0"
+
+            # DeepEP V2 + NCCL Gin envs.
+            - name: NCCL_NET_PLUGIN
+              value: /opt/aws-ofi-nccl/lib/libnccl-net-ofi.so
+            - name: NCCL_GIN_TYPE
+              value: "2"
+            - name: NCCL_GIN_ENABLE
+              value: "1"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_CUMEM_HOST_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: NCCL_IGNORE_DISABLED_P2P
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: enp
+            - name: NCCL_TUNER_PLUGIN
+              value: ""
+            - name: FI_PROVIDER
+              value: efa
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_ENABLE_SHM_TRANSFER
+              value: "0"
+            - name: OFI_NCCL_PROTOCOL
+              value: RDMA
+            - name: OFI_NCCL_GIN_MAX_REQUESTS
+              value: "512"
+            - name: DEEP_EP_BACKEND
+              value: nccl
+            - name: EP_EFA_MAX_QPS
+              value: "2"
+            - name: EP_EFA_RDMA_GBS
+              value: "25.0"
+
+            # FlashInfer's MoE FP8 kernel path needs NVSHMEM/mlx5 which is
+            # not present on AWS EFA. Force vLLM to skip it. DeepEP V2
+            # handles FP8 dispatch itself (use_fp8_dispatch=False path).
+            - name: VLLM_USE_FLASHINFER_MOE_FP8
+              value: "0"
+
+            - name: BASH_ENV
+              value: /dev/null
+
+            # NCCL debug so NET/OFI activation shows in logs.
+            - name: NCCL_DEBUG
+              value: INFO
+            - name: NCCL_DEBUG_SUBSYS
+              value: INIT,NET
+
+            # OPTIONAL: point at your PVC-backed HF cache (Qwen3-30B-A3B-FP8
+            # is ~31 GB so caching once across pods saves ~15 min of
+            # download per pod restart). Uncomment the two env vars and
+            # the volumeMount below and mount your PVC.
+            # - name: HF_HOME
+            #   value: /mnt/weights/huggingface
+            # - name: HUGGINGFACE_HUB_CACHE
+            #   value: /mnt/weights/huggingface/hub
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "4"
+            requests:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "4"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE
+                - SYS_ADMIN
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    # Some HyperPod AMIs ship /etc/shinit_v2 that re-exports
+                    # a stale NCCL_NET_PLUGIN. Neutralize so the env block
+                    # above wins.
+                    if [ -f /etc/shinit_v2 ] && grep -q 'NCCL_NET_PLUGIN' /etc/shinit_v2; then
+                      sed -i 's|.*NCCL_NET_PLUGIN.*|# disabled by statefulset postStart|g' /etc/shinit_v2
+                    fi
+                    mkdir -p /work
+                    true
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /dev/gdrdrv
+              name: gdrdrv
+            # - mountPath: /mnt/weights
+            #   name: weights
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: gdrdrv
+          hostPath:
+            path: /dev/gdrdrv
+            type: CharDevice
+        # - name: weights
+        #   persistentVolumeClaim:
+        #     claimName: REPLACE_WITH_YOUR_WEIGHTS_PVC

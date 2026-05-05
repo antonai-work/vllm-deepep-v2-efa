@@ -1,0 +1,1137 @@
+diff --git a/tests/kernels/moe/parallel_utils.py b/tests/kernels/moe/parallel_utils.py
+index 1663e562966e..883e28db81d1 100644
+--- a/tests/kernels/moe/parallel_utils.py
++++ b/tests/kernels/moe/parallel_utils.py
+@@ -15,7 +15,7 @@
+ from torch.multiprocessing import spawn  # pyright: ignore[reportPrivateImportUsage]
+ from typing_extensions import ParamSpec
+ 
+-from vllm.utils.import_utils import has_deep_ep
++from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2
+ from vllm.utils.network_utils import get_open_port
+ 
+ if has_deep_ep():
+@@ -26,6 +26,11 @@
+         DeepEPLLPrepareAndFinalize,
+     )
+ 
++if has_deep_ep_v2():
++    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_v2 import (
++        DeepEPV2PrepareAndFinalize,
++    )
++
+ ## Parallel Processes Utils
+ 
+ P = ParamSpec("P")
+@@ -55,11 +60,10 @@ def _worker_parallel_launch(
+     torch.accelerator.set_device_index(local_rank)
+     device = torch.device("cuda", local_rank)
+     torch.distributed.init_process_group(
+-        backend="cpu:gloo,cuda:nccl",
++        backend="nccl",
+         init_method=init_method,
+         rank=rank,
+         world_size=world_size,
+-        device_id=device,
+     )
+     barrier = torch.tensor([rank], device=device)
+     torch.distributed.all_reduce(barrier)
+@@ -200,3 +204,40 @@ def make_deepep_a2a(
+ 
+     assert deepep_ll_args is not None
+     return make_deepep_ll_a2a(pg, pgi, deepep_ll_args, q_dtype, block_shape)
++
++
++@dataclasses.dataclass
++class DeepEPV2Args:
++    num_local_experts: int
++    num_experts: int
++    num_topk: int
++    hidden_size: int
++    max_tokens_per_rank: int
++    use_fp8_dispatch: bool
++
++
++def make_deepep_v2_a2a(
++    pg: ProcessGroup,
++    pgi: ProcessGroupInfo,
++    dp_size: int,
++    v2_args: DeepEPV2Args,
++):
++    import deep_ep
++
++    buffer = deep_ep.ElasticBuffer(
++        group=pg,
++        num_max_tokens_per_rank=v2_args.max_tokens_per_rank,
++        hidden=v2_args.hidden_size,
++        num_topk=v2_args.num_topk,
++        use_fp8_dispatch=v2_args.use_fp8_dispatch,
++        explicitly_destroy=True,
++    )
++    return DeepEPV2PrepareAndFinalize(
++        buffer=buffer,
++        num_dispatchers=pgi.world_size,
++        dp_size=dp_size,
++        rank_expert_offset=pgi.rank * v2_args.num_local_experts,
++        num_experts=v2_args.num_experts,
++        num_topk=v2_args.num_topk,
++        use_fp8_dispatch=v2_args.use_fp8_dispatch,
++    )
+diff --git a/tests/kernels/moe/test_deepep_v2_moe.py b/tests/kernels/moe/test_deepep_v2_moe.py
+new file mode 100644
+index 000000000000..d921036b17b7
+--- /dev/null
++++ b/tests/kernels/moe/test_deepep_v2_moe.py
+@@ -0,0 +1,384 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++Test DeepEP v2 (ElasticBuffer) dispatch-combine logic.
++Compares against a pure-PyTorch reference MoE implementation.
++"""
++
++import dataclasses
++
++import pytest
++import torch.distributed
++from torch.distributed import ProcessGroup
++
++from tests.kernels.moe.utils import make_dummy_moe_config
++from vllm import _custom_ops as ops
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.model_executor.layers.activation import SiluAndMul
++from vllm.model_executor.layers.fused_moe import TritonExperts
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEQuantConfig,
++)
++from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
++from vllm.utils.import_utils import has_deep_ep_v2
++from vllm.utils.torch_utils import set_random_seed
++from vllm.v1.worker.workspace import init_workspace_manager
++
++from ...utils import multi_gpu_test
++from .parallel_utils import ProcessGroupInfo, parallel_launch
++
++if has_deep_ep_v2():
++    from .parallel_utils import DeepEPV2Args, make_deepep_v2_a2a
++
++requires_deep_ep_v2 = pytest.mark.skipif(
++    not has_deep_ep_v2(),
++    reason="Requires DeepEP v2 (ElasticBuffer)",
++)
++
++
++def make_weights(
++    e, n, k, dtype
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    if dtype in [torch.float16, torch.bfloat16]:
++        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
++        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
++        return w1, w2, None, None
++
++    assert dtype == torch.float8_e4m3fn
++    w1 = torch.empty((e, 2 * n, k), device="cuda", dtype=torch.float16)
++    w2 = torch.empty((e, k, n), device="cuda", dtype=torch.float16)
++
++    n_b_scales = 2 * n
++    k_b_scales = k
++    w1_q = torch.empty_like(w1, dtype=dtype)
++    w2_q = torch.empty_like(w2, dtype=dtype)
++    w1_scale = torch.empty((e, n_b_scales, 1), device="cuda", dtype=torch.float32)
++    w2_scale = torch.empty((e, k_b_scales, 1), device="cuda", dtype=torch.float32)
++    for expert in range(e):
++        w1_q[expert], w1_scale[expert] = ops.scaled_fp8_quant(
++            w1[expert], use_per_token_if_dynamic=True
++        )
++        w2_q[expert], w2_scale[expert] = ops.scaled_fp8_quant(
++            w2[expert], use_per_token_if_dynamic=True
++        )
++    return w1_q, w2_q, w1_scale, w2_scale
++
++
++@dataclasses.dataclass
++class TestConfig:
++    dtype: torch.dtype
++    topk: int
++    m: int
++    k: int
++    n: int
++    num_experts: int
++
++
++@dataclasses.dataclass
++class TestTensors:
++    rank_tokens: torch.Tensor
++    rank_token_scales: torch.Tensor | None
++    topk: torch.Tensor
++    topk_weights: torch.Tensor
++    config: TestConfig
++
++    @staticmethod
++    def make(config: TestConfig) -> "TestTensors":
++        assert config.dtype in [torch.bfloat16, torch.float8_e4m3fn]
++        token_dtype = (
++            torch.bfloat16 if config.dtype == torch.float8_e4m3fn else config.dtype
++        )
++        rank_tokens = (
++            torch.randn((config.m, config.k), device="cuda", dtype=token_dtype) / 10
++        )
++
++        topk = torch.stack([
++            torch.randperm(config.num_experts, device="cuda")[:config.topk]
++            for _ in range(config.m)
++        ]).to(dtype=torch.int64)
++        topk_weights = torch.randn(topk.shape, dtype=torch.float32, device="cuda")
++        return TestTensors(
++            rank_tokens=rank_tokens,
++            rank_token_scales=None,
++            topk=topk,
++            topk_weights=topk_weights,
++            config=config,
++        )
++
++
++def make_modular_kernel(
++    pg: ProcessGroup,
++    pgi: ProcessGroupInfo,
++    dp_size: int,
++    hidden_size: int,
++    num_experts: int,
++    num_local_experts: int,
++    topk: int,
++    q_dtype: torch.dtype | None,
++    use_fp8_dispatch: bool,
++    quant_config: FusedMoEQuantConfig,
++) -> FusedMoEKernel:
++    v2_args = DeepEPV2Args(
++        num_local_experts=num_local_experts,
++        num_experts=num_experts,
++        num_topk=topk,
++        hidden_size=hidden_size,
++        max_tokens_per_rank=8192,
++        use_fp8_dispatch=use_fp8_dispatch,
++    )
++
++    a2a = make_deepep_v2_a2a(
++        pg=pg,
++        pgi=pgi,
++        dp_size=dp_size,
++        v2_args=v2_args,
++    )
++
++    moe_config = make_dummy_moe_config()
++
++    fused_experts = TritonExperts(
++        moe_config=moe_config,
++        quant_config=quant_config,
++    )
++
++    mk = FusedMoEKernel(
++        prepare_finalize=a2a,
++        fused_experts=fused_experts,
++        inplace=False,
++    )
++    return mk
++
++
++def deepep_v2_moe_impl(
++    pg: ProcessGroup,
++    pgi: ProcessGroupInfo,
++    dp_size: int,
++    test_tensors: TestTensors,
++    w1: torch.Tensor,
++    w2: torch.Tensor,
++    w1_scale: torch.Tensor | None,
++    w2_scale: torch.Tensor | None,
++    num_experts: int,
++    topk: int,
++    use_fp8_dispatch: bool,
++    per_act_token_quant: bool,
++) -> torch.Tensor:
++    num_local_experts = w1.size(0)
++
++    def build_expert_map():
++        expert_map = torch.full((num_experts,), fill_value=-1, dtype=torch.int32)
++        s = pgi.rank * num_local_experts
++        e = s + num_local_experts
++        expert_map[s:e] = torch.tensor(list(range(num_local_experts)))
++        device = torch.accelerator.current_device_index()
++        return expert_map.to(device=device, dtype=torch.int32)
++
++    is_quantized = w1.dtype == torch.float8_e4m3fn
++    q_dtype = torch.float8_e4m3fn if is_quantized else None
++
++    quant_config = FusedMoEQuantConfig.make(
++        q_dtype,
++        w1_scale=w1_scale,
++        w2_scale=w2_scale,
++        per_act_token_quant=per_act_token_quant,
++        a1_scale=test_tensors.rank_token_scales,
++    )
++
++    hidden_size = test_tensors.rank_tokens.size(1)
++
++    mk: FusedMoEKernel = make_modular_kernel(
++        pg,
++        pgi,
++        dp_size,
++        hidden_size,
++        num_experts,
++        num_local_experts,
++        topk,
++        q_dtype,
++        use_fp8_dispatch,
++        quant_config,
++    )
++
++    out = mk.apply(
++        hidden_states=test_tensors.rank_tokens,
++        w1=w1,
++        w2=w2,
++        topk_weights=test_tensors.topk_weights,
++        topk_ids=test_tensors.topk,
++        activation=MoEActivation.SILU,
++        global_num_experts=num_experts,
++        expert_map=build_expert_map(),
++        apply_router_weight_on_input=False,
++    )
++
++    return out
++
++
++def torch_moe_impl(
++    test_tensors: TestTensors,
++    w1: torch.Tensor,
++    w2: torch.Tensor,
++    w1_scale: torch.Tensor | None,
++    w2_scale: torch.Tensor | None,
++    per_act_token_quant: bool,
++):
++    a, topk_ids, topk_weights = (
++        test_tensors.rank_tokens,
++        test_tensors.topk,
++        test_tensors.topk_weights,
++    )
++
++    is_quantized = w1.dtype == torch.float8_e4m3fn
++    a_dtype = a.dtype
++    if is_quantized:
++        w1 = w1.to(dtype=torch.float32) * w1_scale
++        w2 = w2.to(dtype=torch.float32) * w2_scale
++        a = a.to(dtype=torch.float32)
++
++    m, _ = a.shape
++    topk = topk_ids.size(1)
++    out = torch.zeros_like(a)
++
++    for i in range(m):
++        a_i = a[i]
++        o_i = out[i]
++        for j in range(topk):
++            e = topk_ids[i][j]
++            e_w = topk_weights[i][j]
++            w1_e = w1[e]
++            w2_e = w2[e]
++            o_i += (
++                SiluAndMul()(a_i @ w1_e.transpose(0, 1)) @ w2_e.transpose(0, 1)
++            ) * e_w
++
++    if is_quantized:
++        out = out.to(dtype=a_dtype)
++
++    return out
++
++
++def _deep_ep_v2_moe(
++    pgi: ProcessGroupInfo,
++    dp_size: int,
++    config: TestConfig,
++    w1: torch.Tensor,
++    w2: torch.Tensor,
++    w1_scale: torch.Tensor | None,
++    w2_scale: torch.Tensor | None,
++    use_fp8_dispatch: bool,
++    per_act_token_quant: bool,
++):
++    device = torch.device(f"cuda:{pgi.local_rank}")
++    init_workspace_manager(device)
++
++    is_quantized = w1.dtype == torch.float8_e4m3fn
++    device_idx = torch.accelerator.current_device_index()
++    w1 = w1.to(device=device_idx)
++    w2 = w2.to(device=device_idx)
++    if is_quantized:
++        assert w1_scale is not None and w2_scale is not None
++        w1_scale = w1_scale.to(device=device_idx)
++        w2_scale = w2_scale.to(device=device_idx)
++
++    pg = torch.distributed.new_group(list(range(pgi.world_size)))
++    test_tensors = TestTensors.make(config)
++
++    with set_current_vllm_config(VllmConfig()):
++        # Reference
++        torch_combined = torch_moe_impl(
++            test_tensors,
++            w1,
++            w2,
++            w1_scale,
++            w2_scale,
++            per_act_token_quant,
++        )
++
++        # Splice experts for this rank
++        num_local_experts = config.num_experts // pgi.world_size
++        e_start = num_local_experts * pgi.rank
++        e_end = e_start + num_local_experts
++        w1_ep = w1[e_start:e_end]
++        w2_ep = w2[e_start:e_end]
++
++        w1_scale_ep, w2_scale_ep = None, None
++        if is_quantized:
++            w1_scale_ep = w1_scale[e_start:e_end]  # type: ignore
++            w2_scale_ep = w2_scale[e_start:e_end]  # type: ignore
++
++        deepep_combined = deepep_v2_moe_impl(
++            pg,
++            pgi,
++            dp_size,
++            test_tensors,
++            w1_ep,
++            w2_ep,
++            w1_scale_ep,
++            w2_scale_ep,
++            config.num_experts,
++            config.topk,
++            use_fp8_dispatch,
++            per_act_token_quant,
++        )
++
++    torch.testing.assert_close(
++        torch_combined,
++        deepep_combined,
++        atol=6e-2,
++        rtol=6e-2,
++    )
++
++
++MNKs = [
++    (1, 256, 256),
++    (2, 256, 512),
++    (3, 1024, 2048),
++    (32, 256, 1024),
++    (45, 512, 2048),
++    (64, 1024, 1024),
++    (222, 1024, 2048),
++]
++
++DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
++
++
++@pytest.mark.parametrize("use_fp8_dispatch", [False, True])
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize("m,n,k", MNKs)
++@pytest.mark.parametrize("num_experts", [32])
++@pytest.mark.parametrize("topk", [6])
++@pytest.mark.parametrize("world_dp_size", [(2, 1)])
++@multi_gpu_test(num_gpus=2)
++@requires_deep_ep_v2
++def test_deep_ep_v2_moe(
++    use_fp8_dispatch: bool,
++    dtype: torch.dtype,
++    m: int,
++    n: int,
++    k: int,
++    num_experts: int,
++    topk: int,
++    world_dp_size: tuple[int, int],
++    workspace_init,
++):
++    per_act_token_quant = False
++
++    set_random_seed(7)
++    world_size, dp_size = world_dp_size
++    config = TestConfig(dtype=dtype, topk=topk, m=m, k=k, n=n, num_experts=num_experts)
++
++    w1, w2, w1_scale, w2_scale = make_weights(num_experts, n, k, dtype)
++
++    parallel_launch(
++        world_size,
++        _deep_ep_v2_moe,
++        dp_size,
++        config,
++        w1,
++        w2,
++        w1_scale,
++        w2_scale,
++        use_fp8_dispatch,
++        per_act_token_quant,
++    )
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index afd0d1dd501a..a476030fafe9 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -42,6 +42,7 @@
+     "pplx",
+     "deepep_high_throughput",
+     "deepep_low_latency",
++    "deepep_v2",
+     "mori",
+     "nixl_ep",
+     "allgather_reducescatter",
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index f591605d08c7..4243231b8704 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1227,12 +1227,14 @@ def has_blocked_weights():
+             assert a2a_backend in [
+                 "deepep_low_latency",
+                 "deepep_high_throughput",
++                "deepep_v2",
+             ], (
+-                "Microbatching currently only supports the deepep_low_latency and "
+-                f"deepep_high_throughput all2all backend. {a2a_backend} is not "
+-                "supported. To fix use --all2all-backend=deepep_low_latency or "
+-                "--all2all-backend=deepep_high_throughput and install the DeepEP"
+-                " kernels."
++                "Microbatching currently only supports the deepep_low_latency, "
++                "deepep_high_throughput, and deepep_v2 all2all backends. "
++                f"{a2a_backend} is not supported. To fix use "
++                "--all2all-backend=deepep_low_latency, "
++                "--all2all-backend=deepep_high_throughput, or "
++                "--all2all-backend=deepep_v2 and install the DeepEP kernels."
+             )
+ 
+             if not self.model_config.disable_cascade_attn:
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+index 6a15d3f6168a..b72024ec7e27 100644
+--- a/vllm/distributed/device_communicators/all2all.py
++++ b/vllm/distributed/device_communicators/all2all.py
+@@ -15,7 +15,7 @@
+     has_flashinfer_nvlink_one_sided,
+     has_flashinfer_nvlink_two_sided,
+ )
+-from vllm.utils.import_utils import has_deep_ep, has_mori
++from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
+ 
+ from .base_device_communicator import All2AllManagerBase, Cache
+ 
+@@ -760,3 +760,62 @@ def get_handle(self, kwargs):
+             mori_kwargs, self._make_handle
+         )
+         return handle
++
++
++class DeepEPV2All2AllManager(All2AllManagerBase):
++    """
++    All2All communication based on DeepEP v2 ElasticBuffer (unified API).
++    Uses NCCL Gin backend with analytical SM calculation.
++    """
++
++    def __init__(self, cpu_group, tcp_store_group=None):
++        assert has_deep_ep_v2(), (
++            "DeepEP v2 (ElasticBuffer) not found. Please install DeepEP with "
++            "v2 support (epv2-release branch)."
++        )
++        super().__init__(cpu_group, tcp_store_group)
++        self.handle_cache = Cache()
++        self._num_sms: int | None = None
++
++    def _make_all2all_kwargs(
++        self,
++        num_max_tokens_per_rank: int,
++        hidden: int,
++        num_topk: int,
++        use_fp8_dispatch: bool,
++    ) -> dict:
++        return dict(
++            group=self.cpu_group,
++            num_max_tokens_per_rank=num_max_tokens_per_rank,
++            hidden=hidden,
++            num_topk=num_topk,
++            use_fp8_dispatch=use_fp8_dispatch,
++            allow_hybrid_mode=envs.VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE,
++            prefer_overlap_with_compute=envs.VLLM_DEEPEP_V2_PREFER_OVERLAP,
++            allow_multiple_reduction=(envs.VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION),
++        )
++
++    def get_handle(self, kwargs):
++        import deep_ep  # type: ignore[import-not-found]
++
++        num_experts = kwargs.pop("num_experts", 256)
++        buffer_kwargs = self._make_all2all_kwargs(**kwargs)
++        logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
++        handle: deep_ep.ElasticBuffer = self.handle_cache.get_or_create(
++            buffer_kwargs, deep_ep.ElasticBuffer
++        )
++        if self._num_sms is None:
++            self._num_sms = handle.get_theoretical_num_sms(
++                num_experts=num_experts,
++                num_topk=kwargs["num_topk"],
++            )
++        return handle
++
++    def max_sms_used(self) -> int | None:
++        return self._num_sms
++
++    def destroy(self):
++        with self.handle_cache._lock:
++            for _, handle in self.handle_cache._cache.items():
++                handle.destroy()
++            self.handle_cache._cache.clear()
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 74056134c095..7a4914fe3d86 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -137,6 +137,12 @@ def __init__(
+                 from .all2all import MoriAll2AllManager
+ 
+                 self.all2all_manager = MoriAll2AllManager(self.cpu_group)
++            elif self.all2all_backend == "deepep_v2":
++                from .all2all import DeepEPV2All2AllManager
++
++                self.all2all_manager = DeepEPV2All2AllManager(
++                    self.cpu_group, tcp_store_group
++                )
+             elif self.all2all_backend == "nixl_ep":
+                 from .all2all import NixlEPAll2AllManager
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 806aed2a0414..5a4f813946ca 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -233,6 +233,9 @@
+     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
+     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
+     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
++    VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
++    VLLM_DEEPEP_V2_PREFER_OVERLAP: bool = False
++    VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION: bool = False
+     VLLM_DBO_COMM_SMS: int = 20
+     VLLM_PATTERN_MATCH_DEBUG: str | None = None
+     VLLM_DEBUG_DUMP_PATH: str | None = None
+@@ -1620,6 +1623,18 @@ def _get_or_set_default() -> str:
+     "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL": lambda: bool(
+         int(os.getenv("VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL", "0"))
+     ),
++    # DeepEP v2 ElasticBuffer: enable two-tier NVLink+RDMA hybrid mode
++    "VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE": lambda: bool(
++        int(os.getenv("VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE", "1"))
++    ),
++    # DeepEP v2 ElasticBuffer: use fewer SMs at slight throughput cost
++    "VLLM_DEEPEP_V2_PREFER_OVERLAP": lambda: bool(
++        int(os.getenv("VLLM_DEEPEP_V2_PREFER_OVERLAP", "0"))
++    ),
++    # DeepEP v2 ElasticBuffer: trade precision for transfer size in combine
++    "VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION": lambda: bool(
++        int(os.getenv("VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION", "0"))
++    ),
+     # The number of SMs to allocate for communication kernels when running DBO
+     # the rest of the SMs on the device will be allocated to compute
+     "VLLM_DBO_COMM_SMS": lambda: int(os.getenv("VLLM_DBO_COMM_SMS", "20")),
+diff --git a/vllm/model_executor/layers/fused_moe/all2all_utils.py b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+index fba1d4c692af..6d35234a06dd 100644
+--- a/vllm/model_executor/layers/fused_moe/all2all_utils.py
++++ b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+@@ -29,7 +29,12 @@
+     FlashInferNVLinkTwoSidedPrepareAndFinalize,
+ )
+ from vllm.platforms import current_platform
+-from vllm.utils.import_utils import has_deep_ep, has_mori, has_nixl_ep
++from vllm.utils.import_utils import (
++    has_deep_ep,
++    has_deep_ep_v2,
++    has_mori,
++    has_nixl_ep,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -40,6 +45,8 @@
+             DEEPEP_QUANT_BLOCK_SHAPE,
+             DeepEPLLPrepareAndFinalize,
+         )
++    if has_deep_ep_v2():
++        from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
+     if has_mori():
+         from .prepare_finalize.mori import MoriPrepareAndFinalize
+     if has_nixl_ep():
+@@ -78,6 +85,11 @@ def maybe_roundup_layer_hidden_size(
+             hidden_size
+         )
+ 
++    if moe_parallel_config.use_deepep_v2_kernels:
++        hidden_size = DeepEPV2PrepareAndFinalize.maybe_roundup_layer_hidden_size(
++            hidden_size, act_dtype
++        )
++
+     if moe_parallel_config.use_nixl_ep_kernels:
+         hidden_size = NixlEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
+             hidden_size
+@@ -181,6 +193,32 @@ def maybe_make_prepare_finalize(
+             physical_to_global=physical_to_global,
+             local_expert_global_ids=local_expert_global_ids,
+         )
++    elif moe.use_deepep_v2_kernels:
++        assert moe.dp_size == all2all_manager.dp_world_size
++
++        use_fp8_dispatch = (
++            quant_config is not None
++            and quant_config.quant_dtype == current_platform.fp8_dtype()
++            and quant_config.is_block_quantized
++        )
++        all_to_all_args = dict(
++            num_max_tokens_per_rank=moe.max_num_tokens,
++            hidden=moe.hidden_dim,
++            num_topk=moe.experts_per_token,
++            num_experts=moe.num_experts,
++            use_fp8_dispatch=use_fp8_dispatch,
++        )
++        handle = all2all_manager.get_handle(all_to_all_args)
++        prepare_finalize = DeepEPV2PrepareAndFinalize(
++            buffer=handle,
++            num_dispatchers=all2all_manager.world_size,
++            dp_size=all2all_manager.dp_world_size,
++            rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
++            num_experts=moe.num_experts,
++            num_topk=moe.experts_per_token,
++            use_fp8_dispatch=use_fp8_dispatch,
++        )
++
+     elif moe.use_mori_kernels:
+         assert quant_config is not None
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index 565df1324f62..1f3d48ef4633 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -1063,6 +1063,10 @@ def use_mori_kernels(self):
+     def use_nixl_ep_kernels(self):
+         return self.use_all2all_kernels and self.all2all_backend == "nixl_ep"
+ 
++    @property
++    def use_deepep_v2_kernels(self):
++        return self.use_all2all_kernels and self.all2all_backend == "deepep_v2"
++
+     @staticmethod
+     def flatten_tp_across_dp_and_pcp(
+         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
+@@ -1350,6 +1354,10 @@ def use_ag_rs_all2all_kernels(self):
+     def use_nixl_ep_kernels(self):
+         return self.moe_parallel_config.use_nixl_ep_kernels
+ 
++    @property
++    def use_deepep_v2_kernels(self):
++        return self.moe_parallel_config.use_deepep_v2_kernels
++
+     @property
+     def needs_round_robin_routing_tables(self):
+         return self.moe_parallel_config.needs_round_robin_routing_tables
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py
+new file mode 100644
+index 000000000000..f5b3abb68c41
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py
+@@ -0,0 +1,382 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Callable
++
++import deep_ep
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
++from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
++    TopKWeightAndReduceContiguous,
++    TopKWeightAndReduceDelegate,
++)
++from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
++from vllm.utils.math_utils import round_up
++from vllm.v1.worker.ubatching import (
++    dbo_current_ubatch_id,
++    dbo_enabled,
++    dbo_get_previous_event,
++    dbo_switch_to_comm,
++    dbo_switch_to_compute,
++    dbo_switch_to_compute_sync,
++    dbo_yield_and_switch_from_comm_to_compute,
++    dbo_yield_and_switch_from_compute_to_comm,
++)
++
++
++class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
++    """
++    Prepare/Finalize using DeepEP v2 ElasticBuffer (unified API).
++
++    Uses do_expand=True so dispatch produces per-expert-contiguous layout:
++    each (token, expert) pair gets its own row, with expert regions contiguous.
++    Combine handles weighted reduction internally.
++    """
++
++    @staticmethod
++    def maybe_roundup_layer_hidden_size(hidden_size: int, dtype: torch.dtype) -> int:
++        hidden_size_bytes = hidden_size * dtype.itemsize
++        xfer_atom_size = 512  # 32 * 16 (size(int4))
++        if hidden_size_bytes % xfer_atom_size == 0:
++            return hidden_size
++
++        hidden_size_bytes = round_up(hidden_size_bytes, xfer_atom_size)
++        return hidden_size_bytes // dtype.itemsize
++
++    def __init__(
++        self,
++        buffer: deep_ep.ElasticBuffer,
++        num_dispatchers: int,
++        dp_size: int,
++        rank_expert_offset: int,
++        num_experts: int,
++        num_topk: int,
++        use_fp8_dispatch: bool = False,
++    ):
++        super().__init__()
++        self.buffer = buffer
++        self.num_dispatchers_ = num_dispatchers
++        self.dp_size = dp_size
++        self.rank_expert_offset = rank_expert_offset
++        self.num_experts = num_experts
++        self.num_topk = num_topk
++        self.use_fp8_dispatch = use_fp8_dispatch
++        self.async_prepare = True
++
++        # DBO microbatching: one handle slot per micro-batch.
++        self.handles: list[deep_ep.EPHandle | None] = [None, None]
++
++    def num_dispatchers(self) -> int:
++        return self.num_dispatchers_
++
++    def output_is_reduced(self) -> bool:
++        return True
++
++    @property
++    def activation_format(self) -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    def max_num_tokens_per_rank(self) -> int | None:
++        return None
++
++    def topk_indices_dtype(self) -> torch.dtype | None:
++        return torch.int64
++
++    def _do_dispatch(
++        self,
++        tokens: torch.Tensor,
++        token_scales: torch.Tensor | None,
++        rank_topk_ids: torch.Tensor,
++        rank_topk_weights: torch.Tensor,
++        num_experts: int,
++        a1_scale: torch.Tensor | None,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool,
++    ) -> Callable:
++        has_scales = token_scales is not None
++
++        previous_event = dbo_get_previous_event(self.buffer.capture)
++
++        dbo_yield_and_switch_from_compute_to_comm()
++
++        token_data = tokens
++        if has_scales:
++            token_data = (tokens, token_scales)
++
++        (
++            recv_x,
++            recv_topk_idx,
++            recv_topk_weights,
++            handle,
++            event,
++        ) = self.buffer.dispatch(
++            x=token_data,
++            topk_idx=rank_topk_ids,
++            topk_weights=rank_topk_weights,
++            num_experts=num_experts,
++            do_expand=True,
++            previous_event=previous_event,
++            async_with_compute_stream=(self.async_prepare and not dbo_enabled()),
++        )
++
++        a2a_idx = dbo_current_ubatch_id()
++        self.handles[a2a_idx] = handle
++
++        dbo_switch_to_compute_sync()
++
++        return lambda: self._receiver(
++            event,
++            has_scales,
++            recv_x,
++            recv_topk_idx,
++            num_experts,
++            handle.num_recv_tokens_per_expert_list,
++            recv_topk_weights,
++            a1_scale,
++            quant_config,
++            defer_input_quant=defer_input_quant,
++        )
++
++    def _receiver(
++        self,
++        event: deep_ep.EventOverlap,
++        has_scales: bool,
++        recv_x: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
++        recv_topk_idx: torch.Tensor | None,
++        num_experts: int,
++        recv_expert_num_tokens: list[int],
++        recv_topk_weights: torch.Tensor | None,
++        a1_scale: torch.Tensor | None,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool,
++    ) -> mk.PrepareResultType:
++        if event.event is not None:
++            event.current_stream_wait()
++
++        if isinstance(recv_x, tuple):
++            expert_x, expert_x_scale = recv_x
++        else:
++            expert_x, expert_x_scale = recv_x, None
++
++        # With do_expand=True, recv_topk_idx is None — expert assignment
++        # is implicit in the per-expert-contiguous layout. Build topk_ids
++        # from num_recv_tokens_per_expert_list so TritonExperts can index
++        # into the right expert weights.
++        if recv_topk_idx is None:
++            recv_topk_idx = torch.cat([
++                torch.full(
++                    (count,), i + self.rank_expert_offset,
++                    dtype=torch.int64, device=expert_x.device,
++                )
++                for i, count in enumerate(recv_expert_num_tokens)
++                if count > 0
++            ]) if expert_x.numel() > 0 else torch.empty(
++                0, dtype=torch.int64, device=expert_x.device,
++            )
++            recv_topk_idx = recv_topk_idx.unsqueeze(1)
++        else:
++            recv_topk_idx = torch.where(
++                recv_topk_idx == -1,
++                num_experts - 1 if self.rank_expert_offset == 0 else 0,
++                recv_topk_idx + self.rank_expert_offset,
++            )
++
++        # Reshape recv_topk_weights to match recv_topk_idx shape [N, 1]
++        if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
++            recv_topk_weights = recv_topk_weights.unsqueeze(1)
++
++        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
++            recv_expert_num_tokens, device=expert_x.device
++        )
++
++        if not quant_config.is_block_quantized and not defer_input_quant:
++            expert_x_scale = None
++            if expert_x.numel() != 0:
++                expert_x, expert_x_scale = moe_kernel_quantize_input(
++                    expert_x,
++                    a1_scale,
++                    quant_dtype=quant_config.quant_dtype,
++                    per_act_token_quant=False,
++                    block_shape=quant_config.block_shape,
++                    is_fp4_scale_swizzled=quant_config.is_nvfp4_scale_swizzled,
++                )
++
++        return (
++            expert_x,
++            expert_x_scale,
++            expert_tokens_meta,
++            recv_topk_idx,
++            recv_topk_weights,
++        )
++
++    def supports_async(self) -> bool:
++        return True
++
++    def prepare_async(
++        self,
++        a1: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        num_experts: int,
++        expert_map: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool = False,
++    ) -> mk.ReceiverType:
++        if apply_router_weight_on_input:
++            topk = topk_ids.size(1)
++            assert topk == 1, (
++                "apply_router_weight_on_input is only implemented for topk=1"
++            )
++            a1 = a1 * topk_weights.to(a1.dtype)
++
++        if quant_config.is_block_quantized and not defer_input_quant:
++            a1q, a1q_scale = moe_kernel_quantize_input(
++                a1,
++                quant_config.a1_scale,
++                quant_dtype=quant_config.quant_dtype,
++                per_act_token_quant=quant_config.per_act_token_quant,
++                block_shape=quant_config.block_shape,
++            )
++            if a1q_scale is not None and a1q_scale.numel() == 1:
++                a1q_scale = a1q_scale.view(1, 1)
++            a1_post_scale = None
++        else:
++            a1q = a1
++            a1q_scale = None
++            a1_post_scale = (
++                quant_config.a1_gscale
++                if quant_config.quant_dtype == "nvfp4"
++                else quant_config.a1_scale
++            )
++
++        return self._do_dispatch(
++            tokens=a1q,
++            token_scales=a1q_scale,
++            rank_topk_ids=topk_ids,
++            rank_topk_weights=topk_weights,
++            num_experts=num_experts,
++            a1_scale=a1_post_scale,
++            quant_config=quant_config,
++            defer_input_quant=defer_input_quant,
++        )
++
++    def prepare(
++        self,
++        a1: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        num_experts: int,
++        expert_map: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool = False,
++    ) -> mk.PrepareResultType:
++        receiver = self.prepare_async(
++            a1,
++            topk_weights,
++            topk_ids,
++            num_experts,
++            expert_map,
++            apply_router_weight_on_input,
++            quant_config,
++            defer_input_quant,
++        )
++        return receiver()
++
++    def _finalize(
++        self,
++        output: torch.Tensor,
++        fused_expert_output: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_router_weight_on_input: bool,
++        weight_and_reduce_impl: mk.TopKWeightAndReduce,
++        do_async: bool,
++    ) -> Callable | None:
++        a2a_idx = dbo_current_ubatch_id()
++        handle = self.handles[a2a_idx]
++        assert handle is not None
++
++        if fused_expert_output.numel() != 0:
++            if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
++                weight_and_reduce_impl = TopKWeightAndReduceContiguous()
++            fused_expert_output = weight_and_reduce_impl.apply(
++                output=None,
++                fused_expert_output=fused_expert_output,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                apply_router_weight_on_input=apply_router_weight_on_input,
++            )
++
++        previous_event = dbo_get_previous_event(self.buffer.capture)
++        dbo_yield_and_switch_from_compute_to_comm()
++        assert fused_expert_output.dtype == torch.bfloat16, (
++            f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
++        )
++
++        combined_x, _, event = self.buffer.combine(
++            x=fused_expert_output,
++            handle=handle,
++            topk_weights=None,
++            previous_event=previous_event,
++            async_with_compute_stream=do_async and not dbo_enabled(),
++        )
++
++        dbo_switch_to_compute()
++
++        if do_async:
++
++            def _receiver():
++                if event.event is not None:
++                    event.current_stream_wait()
++                dbo_switch_to_comm()
++                output.copy_(combined_x, non_blocking=True)
++                dbo_yield_and_switch_from_comm_to_compute()
++
++            return _receiver
++        else:
++            assert not dbo_enabled()
++            output.copy_(combined_x, non_blocking=True)
++            return None
++
++    def finalize_async(
++        self,
++        output: torch.Tensor,
++        fused_expert_output: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_router_weight_on_input: bool,
++        weight_and_reduce_impl: mk.TopKWeightAndReduce,
++    ) -> Callable:
++        receiver = self._finalize(
++            output,
++            fused_expert_output,
++            topk_weights,
++            topk_ids,
++            apply_router_weight_on_input,
++            weight_and_reduce_impl,
++            True,
++        )
++        assert receiver is not None
++        return receiver
++
++    def finalize(
++        self,
++        output: torch.Tensor,
++        fused_expert_output: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_router_weight_on_input: bool,
++        weight_and_reduce_impl: mk.TopKWeightAndReduce,
++    ) -> None:
++        self._finalize(
++            output,
++            fused_expert_output,
++            topk_weights,
++            topk_ids,
++            apply_router_weight_on_input,
++            weight_and_reduce_impl,
++            False,
++        )
+diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
+index 6cf57c6894ab..fab9839ed32c 100644
+--- a/vllm/utils/import_utils.py
++++ b/vllm/utils/import_utils.py
+@@ -405,6 +405,15 @@ def has_deep_ep() -> bool:
+     return _has_module("deep_ep")
+ 
+ 
++def has_deep_ep_v2() -> bool:
++    """Whether deep_ep with ElasticBuffer (v2 API) is available."""
++    if not _has_module("deep_ep"):
++        return False
++    import deep_ep  # type: ignore[import-not-found]
++
++    return hasattr(deep_ep, "ElasticBuffer")
++
++
+ def has_deep_gemm() -> bool:
+     """Whether the optional `deep_gemm` package is available.
+ 
