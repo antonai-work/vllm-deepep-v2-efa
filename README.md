@@ -12,6 +12,10 @@ over AWS EFA. The core path goes vanilla
 fork pin) and produces a real `/v1/chat/completions` response over
 NCCL Gin + EFA, with no V1-to-V2 compat shim in the serving path.
 
+Base image: [`antonai-work/deepep-v2-efa-base`](https://github.com/antonai-work/deepep-v2-efa-base)
+publishes the `ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a`
+image this repo's fast build path consumes.
+
 Companion repo for training:
 [`antonai-work/nemo-rl-deepep-v2-efa`](https://github.com/antonai-work/nemo-rl-deepep-v2-efa)
 uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
@@ -27,9 +31,9 @@ uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
   `nvidia/cuda:12.9.0-devel-ubuntu24.04` through EFA + aws-ofi-nccl
   + NCCL + GDRCopy + DeepEP V2 (patched) + vLLM (fork pin).
 - **`docker/build.sh`** - one-command build script.
-- **`docker/preflight.sh`** - seven in-container validation gates
-  that prove the stack is assembled correctly before you spend
-  cluster time running it.
+- **`docker/preflight.sh`** - eight in-container validation gates
+  (5 base + 3 vLLM-specific) that prove the stack is assembled
+  correctly before you spend cluster time running it.
 - **`tests/smoke_test.py`** - a 2-pod `torchrun` driver that
   constructs `deep_ep.ElasticBuffer` with the same MoE-shape ctor
   vLLM PR #41183 uses, runs a 20-iter dispatch+combine round trip,
@@ -48,19 +52,32 @@ uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
   [`docs/EFA-TRAFFIC-EVIDENCE.md`](docs/EFA-TRAFFIC-EVIDENCE.md)
   for the aggregated cross-node EFA hardware-counter proof across
   all frameworks.
+- **`ci/buildspec.yml`** + **`ci/CODEBUILD-SETUP.md`** - AWS
+  CodeBuild pipeline that builds both modes, runs preflight in each
+  image, and pushes the fast build to ECR.
 
-## Upstream PRs
+## Upstream
 
-Two PRs, one per upstream repo:
+Two PRs are what this repo ships against directly, plus cross-links
+to PRs filed on the four sibling frameworks that share the same
+DeepEP V2 + EFA substrate. All are open and tracked live in
+`docs/UPSTREAM-STATUS.md`.
 
-| Upstream repo | PR | Status | Patches |
+| Upstream repo | PR | Role for this repo | Status |
 |---|---|---|---|
-| [`deepseek-ai/DeepEP`](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN, 3 commits | `patches/0001-0003` |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN, 16 commits (active) | `patches/vllm-pr41183-deepep-v2.diff` |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | Primary - adds native DeepEP V2 all2all backend. Augmented with our 2-node EFA traffic + 24-token chat-completion evidence. | OPEN, actively reviewed |
+| [`deepseek-ai/DeepEP`](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | Required - 3 EFA patches in `patches/0001-0003` (auto-QP cap, get_rdma_gbs fast path, scaleout interval). | OPEN, 3 commits |
 
-See `docs/UPSTREAM-STATUS.md` for live tracking of merge state.
-When both merge, this repo's build chain reduces to vanilla clones
-with no patches.
+Cross-framework companion PRs (same substrate, different engines):
+
+| Upstream repo | PR | Framework |
+|---|---|---|
+| [`NVIDIA/Megatron-LM`](https://github.com/NVIDIA/Megatron-LM) | [#4632](https://github.com/NVIDIA/Megatron-LM/pull/4632) | DeepEP V2 MoE for Megatron training |
+| [`NVIDIA/NeMo-RL`](https://github.com/NVIDIA/NeMo-RL) | [#2410](https://github.com/NVIDIA/NeMo-RL/pull/2410) / [#2411](https://github.com/NVIDIA/NeMo-RL/pull/2411) | NeMo-RL DeepEP V2 + EFA hooks |
+| [`sgl-project/sglang`](https://github.com/sgl-project/sglang) | [#24443](https://github.com/sgl-project/sglang/pull/24443) | SGLang DeepEP V2 inference path |
+
+When vLLM #41183 and DeepEP #612 merge upstream, this repo's build
+chain reduces to vanilla clones with no patches.
 
 ## Quick start
 
@@ -74,14 +91,42 @@ with no patches.
 
 ### Build
 
+Two build modes produce byte-for-byte equivalent images. Pick based
+on whether you want the fast path (pulls the published base image
+from GHCR, ~10 min) or the offline-reproducible from-vanilla path
+(builds the full stack from `nvidia/cuda`, ~40 min).
+
 ```bash
 git clone https://github.com/antonai-work/vllm-deepep-v2-efa
 cd vllm-deepep-v2-efa
-docker/build.sh vllm-deepep-v2-efa:latest   # ~40 min cold build
+
+# Fast (default): FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+docker/build.sh --mode fast    vllm-deepep-v2-efa:fast
+
+# From vanilla: FROM nvidia/cuda:12.9.0-devel-ubuntu24.04, no GHCR dep
+docker/build.sh --mode vanilla vllm-deepep-v2-efa:vanilla
 ```
 
-The build script applies all patches before compiling, so you know
-you're getting vanilla upstream + exactly the two PRs linked above.
+Either invocation applies the patches deterministically; both produce
+vanilla upstream + exactly the two PRs linked above.
+
+### Fast vs from-vanilla build
+
+Both modes resolve to the same multi-stage `docker/Dockerfile` and
+produce identical final-image content, verified by the in-image
+preflight (`8/8 checks PASS`). The difference is where the substrate
+comes from:
+
+| Aspect | `--mode fast` | `--mode vanilla` |
+|---|---|---|
+| Base stage | `FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a` | `FROM nvidia/cuda:12.9.0-devel-ubuntu24.04`, 240 lines of base stack inlined verbatim from `antonai-work/deepep-v2-efa-base/Dockerfile` |
+| GHCR dependency | Yes (public or PAT with `read:packages`) | No |
+| Cold build time | ~10 min (mostly vLLM install + rebuild of DeepEP against torch ABI) | ~40 min (also compiles aws-ofi-nccl and DeepEP from source) |
+| Use case | Day-to-day iteration, CI pushes to ECR | Offline reproducibility, audit, clean-room rebuild |
+
+Internally, the Dockerfile selects the base with `FROM
+base-${BUILD_MODE} AS release`; swapping modes is a single
+`--build-arg` change.
 
 ### Preflight (in-container)
 
@@ -91,7 +136,7 @@ Before deploying, confirm the image assembled correctly:
 docker run --rm vllm-deepep-v2-efa:latest bash /opt/docker/preflight.sh
 ```
 
-Expected output: `7/7 checks PASS`.
+Expected output: `8/8 checks PASS` (5 base checks + 3 vLLM checks).
 
 ### Deploy + run serving
 
@@ -193,6 +238,28 @@ covered in `docs/DEEPEP-BENCHMARKS.md`, including 2-pod
 `kubectl exec` invocations, the flags that actually matter
 (`EP_EFA_MAX_QPS=2`, `EP_EFA_RDMA_GBS=25.0`,
 `OFI_NCCL_GIN_MAX_REQUESTS=512`), and how to read the output.
+
+## Continuous integration
+
+An AWS CodeBuild pipeline builds both modes, runs the in-image
+preflight gate, and pushes the fast build to ECR. See
+[`ci/CODEBUILD-SETUP.md`](ci/CODEBUILD-SETUP.md) for IAM role, ECR
+repo, Secrets Manager (for the optional GHCR `read:packages` token),
+and `aws codebuild create-project` templates. The buildspec itself
+lives at [`ci/buildspec.yml`](ci/buildspec.yml).
+
+The pipeline:
+
+1. `docker build --build-arg BUILD_MODE=fast` -> runs
+   `/opt/docker/preflight.sh`, must print `8/8 checks PASS` and exit
+   0, then `docker push` to `<acct>.dkr.ecr.<region>.amazonaws.com/vllm-deepep-v2-efa:fast-<sha>`.
+2. `docker build --build-arg BUILD_MODE=vanilla` -> runs the same
+   preflight gate as a validation-only build (not pushed). Proves the
+   repo is offline-reproducible from `nvidia/cuda:12.9.0-devel-ubuntu24.04`
+   without GHCR.
+
+All account IDs, regions, and secret ARNs are CodeBuild environment
+variables; nothing is hardcoded in the checked-in files.
 
 ## Why a separate public repo?
 

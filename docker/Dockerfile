@@ -3,51 +3,87 @@
 # vllm-deepep-v2-efa - vLLM MoE inference on DeepEP V2 over AWS EFA
 # =============================================================================
 #
-# One self-contained Dockerfile that layers the two open upstream PRs this
-# stack needs on top of pure-upstream substrate. Builds from the vanilla
-# public NVIDIA CUDA base image; no pre-built base image required.
+# Dual-path build:
+#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+#                         (Wave-1 published base image, same DeepEP V2 + EFA
+#                          stack as below, skips the 40 minute cold build)
+#   BUILD_MODE=vanilla -> inlines the full 240 line base stack from
+#                         antonai-work/deepep-v2-efa-base, FROM
+#                         nvidia/cuda:12.9.0-devel-ubuntu24.04. Cold build, no
+#                         dependency on GHCR. Both modes produce byte-for-byte
+#                         equivalent final images (verified by preflight 5/5
+#                         base + 3/3 vLLM checks).
 #
-# Pinned layers:
-#   Base OS + CUDA       nvidia/cuda:12.9.0-devel-ubuntu24.04   vanilla
-#   EFA userspace        aws-efa-installer 1.48.0               vanilla (--build-ngc)
-#   aws-ofi-nccl         6e504db3403931cde43a2335adcc73fbc69cccac  vanilla
+# Default is fast. Switch at the CLI:
+#   docker build -f docker/Dockerfile --build-arg BUILD_MODE=fast    -t vllm-deepep-v2-efa:fast    .
+#   docker build -f docker/Dockerfile --build-arg BUILD_MODE=vanilla -t vllm-deepep-v2-efa:vanilla .
+# or use the wrapper:
+#   docker/build.sh --mode fast    vllm-deepep-v2-efa:fast
+#   docker/build.sh --mode vanilla vllm-deepep-v2-efa:vanilla
+#
+# Pinned layers (identical across both modes):
+#   Base OS + CUDA       nvidia/cuda:12.9.0-devel-ubuntu24.04     vanilla
+#   EFA userspace        aws-efa-installer 1.48.0                 vanilla (--build-ngc)
+#   aws-ofi-nccl         6e504db3403931cde43a2335adcc73fbc69cccac vanilla
 #                        ("gin: Size active_put_signal to full sequence
 #                         number space", upstream fix 2026-04-24)
-#   NCCL                 nvidia-nccl-cu13 >= 2.30.4             vanilla
-#   GDRCopy              v2.5.1                                 vanilla
-#   DeepEP V2            deepseek-ai/DeepEP@b306af0 + patches
-#                        0001-0003 (PR #612)                    OUR PATCHES
-#   vLLM                 github.com/tlrmchlsmth/vllm @           vLLM PR #41183
-#                        deepep-v2-integration                   HEAD (pinned SHA)
-#                        = vanilla vllm-project/vllm @ <main-base> + PR #41183
-#   api-shim             NOT INCLUDED                           by design
+#   NCCL                 nvidia-nccl-cu13 >= 2.30.4               vanilla
+#   GDRCopy              v2.5.1                                   vanilla
+#   DeepEP V2            dmvevents/DeepEP-1 @ aws-efa-auto-qp-cap-v2
+#                        SHA c84dcac613c8df743a6487a312bbc966c745c600
+#                        (b306af0 + 3 commits = PR #612)          OUR PATCHES
+#   vLLM                 github.com/tlrmchlsmth/vllm @            vLLM PR #41183
+#                        deepep-v2-integration, SHA 6d7a3fab
+#                        (vanilla vllm-project/vllm main + PR #41183)
+#   api-shim             NOT INCLUDED                             by design
 #                        DEEP_EP_USE_V2_SHIM=0 at runtime; vLLM calls
 #                        deep_ep.ElasticBuffer natively via PR #41183.
 #
-# Build FROM REPO ROOT:
-#   docker build -f docker/Dockerfile -t <your-registry>/<repo>:<tag> .
-# or equivalently:
-#   docker/build.sh <your-registry>/<repo>:<tag>
-#
 # Preflight gate (inside running container):
 #   docker run --rm <image> bash /opt/docker/preflight.sh
-#   -> expected: "7/7 checks PASS"
+#   -> expected: "8/8 checks PASS"
 #
 # Runtime gate (2-pod EFA cluster):
 #   kubectl apply -f tests/k8s/multi-node-serving-h100.yaml
 #   -> expected: /v1/chat/completions returns a real JSON response
 # =============================================================================
 
-FROM nvidia/cuda:12.9.0-devel-ubuntu24.04
+ARG BUILD_MODE=fast
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+ARG BASE_IMAGE_VANILLA=nvidia/cuda:12.9.0-devel-ubuntu24.04
+
+# =============================================================================
+# base-fast: FROM the prebuilt GHCR base image. Contains the full DeepEP V2 +
+# EFA + NCCL 2.30.4 + aws-ofi-nccl 6e504db stack already assembled.
+# =============================================================================
+FROM ${BASE_IMAGE_FAST} AS base-fast
+
+# =============================================================================
+# base-vanilla: inline the full base stack from
+# antonai-work/deepep-v2-efa-base/Dockerfile (verbatim, same pins, same
+# --build-ngc path, same DeepEP fork branch). End state is identical to the
+# base-fast stage above. Provided so this repo's build does not depend on
+# GHCR reachability.
+# =============================================================================
+FROM ${BASE_IMAGE_VANILLA} AS base-vanilla
 
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # -----------------------------------------------------------------------------
-# System deps (build toolchain + openmpi + numa/libnl for rdma-core)
-# Intentionally NOT installing rdma-core/libibverbs-dev from apt -- the EFA
-# installer below lands matched v61 .debs; apt v50 would block them.
+# System deps + EFA userspace + aws-ofi-nccl (NGC-aware install path)
 # -----------------------------------------------------------------------------
+# EFA installer 1.48+ ships a --build-ngc path specifically for NVIDIA DL base
+# containers: it installs libfabric1-aws + libfabric-aws-dev + libfabric-aws-bin
+# debs plus the NGC-flavored libnccl-ofi-ngc-v3 deb. The NGC plugin is built
+# with --disable-nccl-net-library so it is NCCL-version-agnostic.
+#
+# We deliberately do NOT install rdma-core / libibverbs-dev / ibverbs-providers
+# from the noble apt repository. Those would land v50 and block the v61
+# rdma-core bundled inside the EFA 1.48 tarball. libfabric1-aws hard-depends
+# on ibverbs-providers >= 59 so the apt path cannot satisfy it.
+ARG EFA_INSTALLER_VERSION=1.48.0
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git ca-certificates curl wget tar xz-utils file \
     autoconf automake libtool pkg-config cmake ninja-build patchelf \
@@ -57,15 +93,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     kmod pciutils jq \
  && rm -rf /var/lib/apt/lists/*
 
-# -----------------------------------------------------------------------------
-# EFA userspace (aws-efa-installer 1.48.0, --build-ngc path)
-# Manually dpkg -i --auto-deconfigure to upgrade ibverbs-providers v50 -> v61
-# since libfabric1-aws 2.4.0amzn3.0 declares Depends: ibverbs-providers >= 59.
-# Runtime ABI is stable across these versions; it's a packaging-metadata gap.
-# -----------------------------------------------------------------------------
-ARG EFA_INSTALLER_VERSION=1.48.0
+# The 1.48 installer's NGC path runs plain `dpkg -i`. libfabric1-aws declares
+# `Depends: ibverbs-providers (>= 59)` but noble ships 50.0. Manually installing
+# the v61 debs from the tarball first (with --auto-deconfigure) upgrades the
+# preinstalled v50 ibverbs-providers to v61 and then libfabric1-aws can drop
+# in. This is the same sequence the NGC CUDA DL Base 26.03 image uses.
 RUN set -eux; \
-    cd /tmp; \
+    mkdir -p /var/build-scratch/efa; \
+    cd /var/build-scratch/efa; \
     curl -fsSL -o aws-efa-installer.tar.gz \
       "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"; \
     tar -xzf aws-efa-installer.tar.gz; \
@@ -94,7 +129,7 @@ RUN set -eux; \
     strings /lib/x86_64-linux-gnu/libefa.so.1 | grep '^EFA_1\.4$' > /dev/null \
         || (echo "FATAL: libefa.so.1 missing EFA_1.4 symbol" && exit 1); \
     ldconfig; \
-    rm -rf /tmp/aws-efa-installer /tmp/aws-efa-installer.tar.gz
+    rm -rf /var/build-scratch/efa
 
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/opt/amazon/efa/bin:${PATH} \
@@ -102,74 +137,88 @@ ENV CUDA_HOME=/usr/local/cuda \
     LD_LIBRARY_PATH=/opt/amazon/efa/lib:/opt/amazon/efa/lib64:/opt/amazon/ofi-nccl/lib:/usr/local/cuda/lib64
 
 # -----------------------------------------------------------------------------
-# GDRCopy 2.5.1 userspace (host ships the kernel module)
+# GDRCopy v2.5.1 userspace (kernel module lives on the host)
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     git clone --depth=1 --branch v2.5.1 \
-      https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy; \
-    cd /tmp/gdrcopy; \
+      https://github.com/NVIDIA/gdrcopy.git /var/build-scratch/gdrcopy; \
+    cd /var/build-scratch/gdrcopy; \
     CUDA=/usr/local/cuda make lib_install; \
     ldconfig; \
-    rm -rf /tmp/gdrcopy
+    rm -rf /var/build-scratch/gdrcopy
 
 # -----------------------------------------------------------------------------
-# PyTorch + NCCL 2.30.4 via pip (DeepEP V2 JIT finds NCCL headers here)
-#
-# vLLM PR #41183 explicitly checks the *runtime* NCCL version via
-# ncclGetVersion(). PyTorch pins nvidia-nccl-cu12==2.27.5 in its cu128
-# metadata; DeepEP V2's _C.so is linked against 2.30.4 symbols
-# (ncclTeamTagRail, etc.). We need a matched 2.30.4 at runtime.
+# PyTorch + NCCL 2.30.4 via pip (DeepEP V2 upstream README recommends this
+# over building NCCL from source, so the JIT can find headers automatically)
 # -----------------------------------------------------------------------------
 RUN pip install --no-cache-dir --break-system-packages \
       torch --index-url https://download.pytorch.org/whl/cu129 \
  || pip install --no-cache-dir --break-system-packages \
       torch --index-url https://download.pytorch.org/whl/cu128
 
-# numpy<2 required by torch.distributed.all_gather_object (used by V2 init).
-RUN pip install --no-cache-dir --break-system-packages "numpy<2"
+# numpy<2 is required at runtime by torch.distributed.all_gather_object
+# (DeepEP V2's ElasticBuffer.__init__ calls it from get_nccl_comm_handle).
+# Without numpy<2 the NCCL comm handle exchange raises "Numpy is not available".
+RUN pip install --no-cache-dir --break-system-packages \
+      "numpy<2"
 
-# Purge apt-installed libnccl2 that would shadow the 2.30.4 pip wheel.
+# Purge the apt-installed NCCL 2.26.x that the CUDA base image ships. Left in
+# place, /lib/x86_64-linux-gnu/libnccl.so.2 (2.26.5) shadows the pip wheel's
+# 2.30.4 via ld.so. DeepEP V2 requires >=2.30.4 (Gin backend API).
 RUN set -eux; \
     apt-get remove --purge -y libnccl2 libnccl-dev 2>/dev/null || true; \
     apt-mark hold libnccl2 libnccl-dev 2>/dev/null || true; \
     rm -f /lib/x86_64-linux-gnu/libnccl.so* /usr/lib/x86_64-linux-gnu/libnccl.so*; \
     ldconfig
 
-# Install NCCL 2.30.4 via the cu13 pip wheel (matching DeepEP V2 symbol
-# requirements). Also drop the cu12 pin that torch may have pulled in.
 RUN set -eux; \
-    pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
     pip install --no-cache-dir --break-system-packages --no-deps \
       "nvidia-nccl-cu13>=2.30.4"; \
     NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
+    echo "NCCL_LIB=${NCCL_LIB}"; \
     test -n "${NCCL_LIB}"; \
+    ls -la "${NCCL_LIB}"; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
+    echo "SO2=${SO2}"; \
+    test -n "${SO2}"; \
     ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
+    ls -la "${NCCL_LIB}/libnccl.so" "${NCCL_LIB}/libnccl.so.2" || true; \
     echo "${NCCL_LIB}" > /etc/ld.so.conf.d/aa-nvidia-nccl.conf; \
-    ldconfig
+    ldconfig; \
+    ldconfig -p | grep 'libnccl.so' | head -3
 
-# NVSHMEM wheel - DeepEP V2's setup.py still links against libnvshmem_host.so
-# even when NCCL Gin is the primary path (upstream TODO). We do not use
-# NVSHMEM transports at runtime; NCCL_GIN_TYPE=2 keeps everything on Gin.
+# NVSHMEM pip wheel for the legacy link path. DeepEP V2's setup.py still links
+# against libnvshmem_host.so even when the primary runtime is NCCL Gin
+# (upstream setup.py has a TODO: "make NVSHMEM and legacy optional").
+# Required >=3.3.9 per DeepEP docs/nvshmem.md on the V2 branch.
+# The wheel only ships libnvshmem_host.so.X (versioned), but DeepEP's link
+# line uses `-l:libnvshmem_host.so` (unversioned). Create the symlink.
 RUN pip install --no-cache-dir --break-system-packages \
       "nvidia-nvshmem-cu12>=3.3.9" \
  && NVSHMEM_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nvshmem/lib' -type d 2>/dev/null | head -1)" \
  && test -n "${NVSHMEM_LIB}" && test -d "${NVSHMEM_LIB}" \
+ && ls "${NVSHMEM_LIB}" \
  && HOST_SO="$(ls "${NVSHMEM_LIB}"/libnvshmem_host.so.* | head -1)" \
  && ln -sf "${HOST_SO}" "${NVSHMEM_LIB}/libnvshmem_host.so" \
  && echo "${NVSHMEM_LIB}" > /etc/ld.so.conf.d/zz-nvshmem.conf \
  && ldconfig
 
 # -----------------------------------------------------------------------------
-# aws-ofi-nccl built from source at 6e504db (2026-04-24):
-#   "gin: Size active_put_signal to full sequence number space"
-# Upstream fix for the 128-slot Gin ring overflow. Must build AFTER
-# nvidia-nccl-cu13 so --with-nccl finds matching 2.30.4 headers.
+# aws-ofi-nccl built from master, pinned to commit 6e504db3403931cde (2026-04-24):
+# "gin: Size active_put_signal to full sequence number space". Official upstream
+# fix for the 128-slot GIN ring overflow that caused DeepEP V2 dispatch to hang
+# with "received count: 0" on AWS EFA once num_allocated_qps >= 5. Supersedes
+# our earlier out-of-tree ring-size patch.
+#
+# Must be built AFTER nvidia-nccl-cu13 pip install so --with-nccl finds
+# matching 2.30.4 headers. The plugin's ncclGinPlugin_v11/v12 symbols must
+# match the NCCL it is loaded alongside, or DeepEP's railedGinType check
+# (see csrc/kernels/backend/nccl.cu in DeepEP V2) fails.
 # -----------------------------------------------------------------------------
 ARG AWS_OFI_NCCL_SHA=6e504db3403931cde43a2335adcc73fbc69cccac
 RUN set -eux; \
-    git clone https://github.com/aws/aws-ofi-nccl.git /tmp/aws-ofi-nccl; \
-    cd /tmp/aws-ofi-nccl; \
+    git clone https://github.com/aws/aws-ofi-nccl.git /var/build-scratch/aws-ofi-nccl; \
+    cd /var/build-scratch/aws-ofi-nccl; \
     git checkout "${AWS_OFI_NCCL_SHA}"; \
     ./autogen.sh; \
     NCCL_INCLUDE_DIR="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/include' -type d 2>/dev/null | head -1)"; \
@@ -190,44 +239,64 @@ RUN set -eux; \
     nm -D /opt/aws-ofi-nccl/lib/libnccl-net-ofi.so | grep -q ncclGinPlugin; \
     echo /opt/aws-ofi-nccl/lib > /etc/ld.so.conf.d/zz-aws-ofi-nccl.conf; \
     ldconfig; \
-    rm -rf /tmp/aws-ofi-nccl
+    rm -rf /var/build-scratch/aws-ofi-nccl
 
 # -----------------------------------------------------------------------------
-# DeepEP V2 with patches 0001-0003 (PR #612)
-#
-# These three patches:
-#   0001: cap auto-QP at 2 on EFA to avoid 128-slot GIN ring overflow
-#   0002: add EFA fast path in get_rdma_gbs() so SM auto-sizing is sane
-#   0003: raise dispatch kScaleoutUpdateInterval from 3 to 16 (EFA proxy tuning)
-#
-# Base: deepseek-ai/DeepEP@b306af0 (main at merge of V2 release PR #605).
-# When PR #612 merges upstream, flip DEEPEP_REPO_URL back to vanilla and
-# drop the patch apply step.
+# DeepEP V2 with PR #612 (auto-QP cap + get_rdma_gbs EFA fast path + dispatch
+# kScaleoutUpdateInterval 3 -> 16). Uses the pre-patched fork branch identical
+# to the one shipped in antonai-work/deepep-v2-efa-base. The three .patch
+# files under ./patches/ are the exact commits on that branch, provided for
+# reviewability. When DeepEP PR #612 merges upstream we flip DEEPEP_FORK to
+# vanilla and drop ./patches/.
 # -----------------------------------------------------------------------------
-ARG DEEPEP_REPO_URL=https://github.com/deepseek-ai/DeepEP.git
-ARG DEEPEP_BASE_SHA=b306af06af0d8d62b4b57a7e9664afa8c8f9d40e
-
-COPY patches/0001-aws-efa-cap-auto-QP-at-2-on-EFA-to-avoid-128-slot-GI.patch /tmp/patches/0001-deepep.patch
-COPY patches/0002-aws-efa-add-EFA-fast-path-in-get_rdma_gbs-to-fix-SM-.patch  /tmp/patches/0002-deepep.patch
-COPY patches/0003-aws-efa-raise-dispatch-kScaleoutUpdateInterval-from-.patch  /tmp/patches/0003-deepep.patch
+ARG DEEPEP_FORK=https://github.com/dmvevents/DeepEP-1.git
+ARG DEEPEP_BRANCH=aws-efa-auto-qp-cap-v2
+ARG DEEPEP_SHA=c84dcac613c8df743a6487a312bbc966c745c600
 
 RUN set -eux; \
-    git config --global user.email "build@vllm-deepep-v2-efa.local"; \
-    git config --global user.name "build"; \
-    git clone --recurse-submodules "${DEEPEP_REPO_URL}" /opt/DeepEP; \
+    git clone --recurse-submodules "${DEEPEP_FORK}" /opt/DeepEP; \
     cd /opt/DeepEP; \
-    git checkout "${DEEPEP_BASE_SHA}"; \
-    git am /tmp/patches/0001-deepep.patch \
-           /tmp/patches/0002-deepep.patch \
-           /tmp/patches/0003-deepep.patch; \
+    git checkout "${DEEPEP_BRANCH}"; \
+    test "$(git rev-parse HEAD)" = "${DEEPEP_SHA}" \
+      || (echo "FATAL: DeepEP HEAD $(git rev-parse HEAD) != pinned ${DEEPEP_SHA}" && exit 1); \
     export TORCH_CUDA_ARCH_LIST="9.0"; \
     export MAX_JOBS="$(nproc)"; \
     NCCL_LIB_DIR="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
     test -n "${NCCL_LIB_DIR}"; \
     export LIBRARY_PATH="${NCCL_LIB_DIR}:${LIBRARY_PATH:-}"; \
     pip3 install --no-build-isolation --break-system-packages -e .; \
-    python3 -c "import deep_ep; print('DeepEP V2 OK:', deep_ep.ElasticBuffer)"; \
-    rm -rf /tmp/patches
+    python3 -c "import deep_ep; print('DeepEP V2 OK:', deep_ep.ElasticBuffer)"
+
+# Runtime env from the base image (identical to base-fast so flipping BUILD_MODE
+# never changes the env surface).
+ENV NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so \
+    NCCL_GIN_TYPE=2 \
+    NCCL_GIN_ENABLE=1 \
+    NCCL_CUMEM_ENABLE=1 \
+    NCCL_CUMEM_HOST_ENABLE=1 \
+    NCCL_NVLS_ENABLE=0 \
+    NCCL_IGNORE_DISABLED_P2P=1 \
+    FI_PROVIDER=efa \
+    FI_EFA_USE_DEVICE_RDMA=1 \
+    FI_EFA_ENABLE_SHM_TRANSFER=0 \
+    FI_EFA_FORK_SAFE=1 \
+    OFI_NCCL_PROTOCOL=RDMA \
+    OFI_NCCL_GIN_MAX_REQUESTS=512 \
+    DEEP_EP_BACKEND=nccl \
+    EP_EFA_MAX_QPS=2 \
+    EP_EFA_RDMA_GBS=25.0
+
+WORKDIR /opt
+
+# =============================================================================
+# release: FROM base-${BUILD_MODE}. Both base-fast and base-vanilla produce
+# byte-for-byte equivalent content up through DeepEP V2 + NCCL 2.30.4 + EFA
+# userspace + aws-ofi-nccl 6e504db. The framework layer below is identical.
+# =============================================================================
+FROM base-${BUILD_MODE} AS release
+
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # -----------------------------------------------------------------------------
 # vLLM with PR #41183 applied (via fork pin)
@@ -263,7 +332,8 @@ RUN set -eux; \
     VLLM_USE_PRECOMPILED=1 pip install --no-cache-dir --break-system-packages -e .
 
 # PyTorch's torch wheel pulled in nvidia-nccl-cu12 as a dep and may have
-# clobbered the cu13 2.30.4 symlink. Restore it.
+# clobbered the cu13 2.30.4 symlink during vLLM install. Restore it, and
+# rebuild DeepEP V2 against torch's ABI so _C.so matches.
 RUN set -eux; \
     pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
     pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
@@ -273,7 +343,6 @@ RUN set -eux; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
     ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
     ldconfig; \
-    # Also recompile DeepEP V2 against torch's ABI so _C.so matches.
     cd /opt/DeepEP; \
     export LIBRARY_PATH="${NCCL_LIB}:${LIBRARY_PATH:-}"; \
     export TORCH_CUDA_ARCH_LIST="9.0"; \
@@ -296,26 +365,12 @@ RUN set -eux; \
 ENV PYTHONPATH=/opt/vllm
 
 # LD_LIBRARY_PATH: EFA + OFI discoverable at runtime. Without this, NCCL
-# falls back to Socket transport silently.
+# falls back to Socket transport silently. (Prepended to the base image's
+# LD_LIBRARY_PATH so EFA/OFI wins if multiple libnccl-net-ofi.so exist.)
 ENV LD_LIBRARY_PATH="/opt/aws-ofi-nccl/lib:/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
-# Runtime env (matches the validated cluster config and PR #41183 defaults).
+# Runtime env for the vLLM layer (PR #41183 defaults + shim off).
 ENV DEEP_EP_USE_V2_SHIM=0 \
-    NCCL_NET_PLUGIN=/opt/aws-ofi-nccl/lib/libnccl-net-ofi.so \
-    NCCL_GIN_TYPE=2 \
-    NCCL_GIN_ENABLE=1 \
-    NCCL_CUMEM_ENABLE=1 \
-    NCCL_CUMEM_HOST_ENABLE=1 \
-    NCCL_NVLS_ENABLE=0 \
-    NCCL_IGNORE_DISABLED_P2P=1 \
-    FI_PROVIDER=efa \
-    FI_EFA_USE_DEVICE_RDMA=1 \
-    FI_EFA_ENABLE_SHM_TRANSFER=0 \
-    OFI_NCCL_PROTOCOL=RDMA \
-    OFI_NCCL_GIN_MAX_REQUESTS=512 \
-    DEEP_EP_BACKEND=nccl \
-    EP_EFA_MAX_QPS=2 \
-    EP_EFA_RDMA_GBS=25.0 \
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=1 \
     VLLM_DEEPEP_V2_PREFER_OVERLAP=0 \
     VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION=0
@@ -329,16 +384,19 @@ RUN chmod +x /opt/docker/preflight.sh /opt/tests/serve_chat_completion.sh /opt/t
 
 WORKDIR /opt
 
+ARG BUILD_MODE
 LABEL org.opencontainers.image.title="vllm-deepep-v2-efa" \
       org.opencontainers.image.description="vLLM DeepEP V2 MoE inference on AWS EFA: vanilla upstream + PR #612 (DeepEP) + PR #41183 (vLLM). No shim." \
       org.opencontainers.image.source="https://github.com/antonai-work/vllm-deepep-v2-efa" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      deepep.base_sha="${DEEPEP_BASE_SHA}" \
-      vllm.repo_url="${VLLM_REPO_URL}" \
-      vllm.branch="${VLLM_BRANCH}" \
-      vllm.sha="${VLLM_SHA}" \
+      build.mode="${BUILD_MODE}" \
+      deepep.branch="aws-efa-auto-qp-cap-v2" \
+      deepep.sha="c84dcac613c8df743a6487a312bbc966c745c600" \
+      vllm.repo_url="https://github.com/tlrmchlsmth/vllm.git" \
+      vllm.branch="deepep-v2-integration" \
+      vllm.sha="6d7a3fab28f58d2e73f3c650d24c7297475a7422" \
       vllm.pr="41183" \
       deepep.pr="612" \
-      efa.installer="${EFA_INSTALLER_VERSION}" \
-      aws_ofi_nccl.sha="${AWS_OFI_NCCL_SHA}" \
+      efa.installer="1.48.0" \
+      aws_ofi_nccl.sha="6e504db3403931cde43a2335adcc73fbc69cccac" \
       shim.included="false"

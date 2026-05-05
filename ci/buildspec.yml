@@ -1,0 +1,147 @@
+# AWS CodeBuild buildspec for vllm-deepep-v2-efa.
+#
+# Runs the dual-path docker build:
+#   1. Fast path    (BUILD_MODE=fast)    -> pushed to ECR with tag :fast-<sha>
+#                                           and (if on main) :fast-latest.
+#   2. Vanilla path (BUILD_MODE=vanilla) -> validation-only build. Proves the
+#                                           repo is offline-reproducible from
+#                                           vanilla nvidia/cuda. Not pushed.
+#
+# Preflight runs inside each built image. An image only passes if the
+# preflight script prints a "8/8 checks PASS"-shaped line and exits 0.
+#
+# Required CodeBuild environment variables (set in the CodeBuild project,
+# NOT hardcoded in this file):
+#   AWS_ACCOUNT_ID                         - ECR destination account
+#   AWS_REGION                             - e.g. us-east-2
+#   ECR_REPO                               - e.g. vllm-deepep-v2-efa
+#   GHCR_READ_TOKEN_SECRET_ARN             - Secrets Manager ARN of a GitHub
+#                                            PAT with read:packages scope.
+#                                            Used ONLY by the fast build to
+#                                            pull the private GHCR base image.
+#                                            Optional - if GHCR flips public.
+#
+# See ci/CODEBUILD-SETUP.md for the IAM role, secret, and project provisioning
+# commands (all placeholders, no hardcoded account ID).
+
+version: 0.2
+
+env:
+  variables:
+    DOCKER_BUILDKIT: "1"
+    BASE_IMAGE_FAST: "ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a"
+    PREFLIGHT_MARKER: "8/8 checks PASS"
+
+phases:
+  install:
+    commands:
+      - echo "[install] Installing AWS CLI v2 and docker-buildx helpers"
+      - docker --version
+      - aws --version
+      - apt-get update -y || yum -y install jq || true
+      - jq --version || true
+
+  pre_build:
+    commands:
+      - echo "[pre_build] Starting $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - echo "[pre_build] CodeBuild project -> AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}, AWS_REGION=${AWS_REGION}, ECR_REPO=${ECR_REPO}"
+      - test -n "${AWS_ACCOUNT_ID}" || (echo "ERROR: AWS_ACCOUNT_ID unset" && exit 2)
+      - test -n "${AWS_REGION}"     || (echo "ERROR: AWS_REGION unset" && exit 2)
+      - test -n "${ECR_REPO}"       || (echo "ERROR: ECR_REPO unset" && exit 2)
+      - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - echo "[pre_build] ECR_REGISTRY=${ECR_REGISTRY}"
+      - echo "[pre_build] Logging in to ECR"
+      - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+      - |
+        if [ -n "${GHCR_READ_TOKEN_SECRET_ARN:-}" ]; then
+          echo "[pre_build] Logging in to GHCR with token from Secrets Manager"
+          GHCR_TOKEN="$(aws secretsmanager get-secret-value --secret-id "${GHCR_READ_TOKEN_SECRET_ARN}" --query SecretString --output text)"
+          GHCR_USER="${GHCR_USER:-antonai-work}"
+          echo "${GHCR_TOKEN}" | docker login ghcr.io --username "${GHCR_USER}" --password-stdin
+          unset GHCR_TOKEN
+        else
+          echo "[pre_build] GHCR_READ_TOKEN_SECRET_ARN not set; assuming GHCR package is public"
+        fi
+      - GIT_SHA_SHORT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+      - echo "[pre_build] GIT_SHA_SHORT=${GIT_SHA_SHORT}"
+      - echo "[pre_build] Pulling base image for fast path"
+      - docker pull "${BASE_IMAGE_FAST}" || (echo "ERROR: cannot pull ${BASE_IMAGE_FAST}. Check GHCR auth or flip package to public." && exit 3)
+
+  build:
+    commands:
+      - echo "===================================================================="
+      - echo "[build] Phase 1/2: BUILD_MODE=fast"
+      - echo "===================================================================="
+      - FAST_TAG_SHA="${ECR_REGISTRY}/${ECR_REPO}:fast-${GIT_SHA_SHORT}"
+      - FAST_TAG_LATEST="${ECR_REGISTRY}/${ECR_REPO}:fast-latest"
+      - echo "[build] Building ${FAST_TAG_SHA}"
+      - |
+        docker build \
+          -f docker/Dockerfile \
+          --build-arg BUILD_MODE=fast \
+          -t "${FAST_TAG_SHA}" \
+          -t "${FAST_TAG_LATEST}" \
+          .
+      - echo "[build] Running preflight inside ${FAST_TAG_SHA}"
+      - |
+        set -o pipefail
+        docker run --rm "${FAST_TAG_SHA}" bash /opt/docker/preflight.sh 2>&1 | tee /tmp/preflight-fast.log
+        PF_RC=$?
+        echo "[build] fast preflight rc=${PF_RC}"
+        if ! grep -q "${PREFLIGHT_MARKER}" /tmp/preflight-fast.log; then
+          echo "ERROR: fast preflight did not print '${PREFLIGHT_MARKER}'"
+          exit 4
+        fi
+        if [ "${PF_RC}" -ne 0 ]; then
+          echo "ERROR: fast preflight exited with rc=${PF_RC}"
+          exit "${PF_RC}"
+        fi
+      - echo "===================================================================="
+      - echo "[build] Phase 2/2: BUILD_MODE=vanilla (validation-only, not pushed)"
+      - echo "===================================================================="
+      - VANILLA_TAG="vllm-deepep-v2-efa:vanilla-${GIT_SHA_SHORT}"
+      - echo "[build] Building ${VANILLA_TAG}"
+      - |
+        docker build \
+          -f docker/Dockerfile \
+          --build-arg BUILD_MODE=vanilla \
+          -t "${VANILLA_TAG}" \
+          .
+      - echo "[build] Running preflight inside ${VANILLA_TAG}"
+      - |
+        set -o pipefail
+        docker run --rm "${VANILLA_TAG}" bash /opt/docker/preflight.sh 2>&1 | tee /tmp/preflight-vanilla.log
+        PF_RC=$?
+        echo "[build] vanilla preflight rc=${PF_RC}"
+        if ! grep -q "${PREFLIGHT_MARKER}" /tmp/preflight-vanilla.log; then
+          echo "ERROR: vanilla preflight did not print '${PREFLIGHT_MARKER}'"
+          exit 5
+        fi
+        if [ "${PF_RC}" -ne 0 ]; then
+          echo "ERROR: vanilla preflight exited with rc=${PF_RC}"
+          exit "${PF_RC}"
+        fi
+
+  post_build:
+    commands:
+      - echo "[post_build] Starting $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ]; then
+          echo "[post_build] Build failing; skipping ECR push"
+          exit 0
+        fi
+      - echo "[post_build] Pushing fast tags to ECR"
+      - docker push "${FAST_TAG_SHA}"
+      - docker push "${FAST_TAG_LATEST}"
+      - echo "[post_build] Recording image digests"
+      - FAST_DIGEST="$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "${FAST_TAG_SHA}" | head -1 || true)"
+      - VANILLA_ID="$(docker inspect --format='{{.Id}}' "${VANILLA_TAG}" || true)"
+      - echo "[post_build] fast    digest  = ${FAST_DIGEST}"
+      - echo "[post_build] vanilla image   = ${VANILLA_ID}"
+      - echo "[post_build] Done at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+artifacts:
+  files:
+    - /tmp/preflight-fast.log
+    - /tmp/preflight-vanilla.log
+  discard-paths: yes
