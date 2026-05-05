@@ -44,7 +44,10 @@ uses the same DeepEP V2 + EFA substrate for Megatron/NeMo-RL training.
 - **`tests/verify_efa_traffic.sh`** - EFA counter snapshot + delta
   check that proves MoE traffic went over EFA, not NVLink.
 - **`docs/`** - deeper explanations of architecture, validation,
-  upstream status, and DeepEP microbenchmarks.
+  upstream status, and DeepEP microbenchmarks. See
+  [`docs/EFA-TRAFFIC-EVIDENCE.md`](docs/EFA-TRAFFIC-EVIDENCE.md)
+  for the aggregated cross-node EFA hardware-counter proof across
+  all frameworks.
 
 ## Upstream PRs
 
@@ -210,6 +213,22 @@ git clone https://github.com/deepseek-ai/DeepEP -b <tag>
 
 Until then, the patches in `patches/` let anyone reproduce the
 validated stack today.
+
+## Validation
+
+Full cross-framework verbatim evidence (marker counts, curl
+responses, activation log lines, EFA counter deltas, image digests,
+SHA-256 hashes of raw log chunks) is inlined in
+[`docs/VALIDATION-EVIDENCE.md`](docs/VALIDATION-EVIDENCE.md). This
+covers vLLM Run #10 (real 24-token Qwen3-30B-A3B-FP8 chat completion
+on DP=16 EP=16) and TRT-LLM Run #5 (DeepEP fast-path activation
+closing the `enable_attention_dp` gate, 4x512 tokens, 4.58 GB EFA
+TX).
+
+Training-side evidence (Megatron-LM, NeMo-RL, SGLang) is in the
+sibling repo
+[`antonai-work/nemo-rl-deepep-v2-efa`](https://github.com/antonai-work/nemo-rl-deepep-v2-efa)
+under the same filename.
 
 ## License
 
