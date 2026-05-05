@@ -30,6 +30,13 @@ env:
   variables:
     DOCKER_BUILDKIT: "1"
     BASE_IMAGE_FAST: "ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a"
+    # CONTRACT: docker/preflight.sh prints a single line of the form
+    # "<pass>/<total> checks PASS" (currently "8/8 checks PASS") at the
+    # end of a healthy run. The greps below match this exact shape. If
+    # you add/remove preflight checks, update the integer here AND keep
+    # the marker line in preflight.sh. Rationale: standardized marker
+    # so future repos copying this pattern cannot drift between the
+    # emitter (preflight.sh) and the reader (buildspec grep).
     PREFLIGHT_MARKER: "8/8 checks PASS"
 
 phases:

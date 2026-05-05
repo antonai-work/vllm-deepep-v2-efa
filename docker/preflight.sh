@@ -204,6 +204,13 @@ fi
 echo
 echo "${HEADER}"
 echo "Preflight result: ${pass_count} PASS, ${fail_count} FAIL"
+# CONTRACT: the next echo emits the standardized marker
+# "<pass>/<total> checks PASS" (e.g. "8/8 checks PASS") that CI greps for.
+# Do NOT remove or reword this line. The buildspec PREFLIGHT_MARKER
+# variable and any downstream pipelines rely on this exact format.
+# See ci/buildspec.yml (PREFLIGHT_MARKER).
+total_count=$((pass_count + fail_count))
+echo "${pass_count}/${total_count} checks PASS"
 echo "${HEADER}"
 
 exit "${fail_count}"
