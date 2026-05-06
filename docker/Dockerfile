@@ -4,12 +4,12 @@
 # =============================================================================
 #
 # Dual-path build:
-#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
-#                         (Wave-1 published base image, same DeepEP V2 + EFA
+#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a
+#                         (Wave 13 cu13-native base, same DeepEP V2 + EFA
 #                          stack as below, skips the 40 minute cold build)
 #   BUILD_MODE=vanilla -> inlines the full 240 line base stack from
 #                         antonai-work/deepep-v2-efa-base, FROM
-#                         nvidia/cuda:12.9.0-devel-ubuntu24.04. Cold build, no
+#                         nvidia/cuda:13.0.0-devel-ubuntu24.04. Cold build, no
 #                         dependency on GHCR. Both modes produce byte-for-byte
 #                         equivalent final images (verified by preflight 5/5
 #                         base + 3/3 vLLM checks).
@@ -22,12 +22,15 @@
 #   docker/build.sh --mode vanilla vllm-deepep-v2-efa:vanilla
 #
 # Pinned layers (identical across both modes):
-#   Base OS + CUDA       nvidia/cuda:12.9.0-devel-ubuntu24.04     vanilla
+#   Base OS + CUDA       nvidia/cuda:13.0.0-devel-ubuntu24.04     vanilla
 #   EFA userspace        aws-efa-installer 1.48.0                 vanilla (--build-ngc)
 #   aws-ofi-nccl         6e504db3403931cde43a2335adcc73fbc69cccac vanilla
 #                        ("gin: Size active_put_signal to full sequence
 #                         number space", upstream fix 2026-04-24)
 #   NCCL                 nvidia-nccl-cu13 >= 2.30.4               vanilla
+#                        (Wave 13 cu13 cascade; supersedes Wave 9b cu12
+#                         unification after Wave 11 revealed torch/vllm._C
+#                         cu13 wheel vs. cu12 base ABI split)
 #   GDRCopy              v2.5.1                                   vanilla
 #   DeepEP V2            dmvevents/DeepEP-1 @ aws-efa-auto-qp-cap-v2
 #                        SHA 146cc356aa00c39ac1590c05775e05b0f031e70c
@@ -49,8 +52,14 @@
 # =============================================================================
 
 ARG BUILD_MODE=fast
-ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
-ARG BASE_IMAGE_VANILLA=nvidia/cuda:12.9.0-devel-ubuntu24.04
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a
+ARG BASE_IMAGE_VANILLA=nvidia/cuda:13.0.0-devel-ubuntu24.04
+# Wave 13 cu13 cascade: single cu13 NCCL throughout. Base image v0.2.1-sm90a is
+# a cu13-native rebuild, so torch cu130 + nvidia-nccl-cu13 + DeepEP _C.so all
+# share libcudart.so.13. Supersedes Wave 9b cu12 unification which broke on
+# Wave 11 with `invalid device ordinal` due to residual torch/vllm._C cu13
+# wheel vs. cu12 base ABI split.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu13>=2.30.4
 
 # =============================================================================
 # base-fast: FROM the prebuilt GHCR base image. Contains the full DeepEP V2 +
@@ -152,9 +161,9 @@ RUN set -eux; \
 # over building NCCL from source, so the JIT can find headers automatically)
 # -----------------------------------------------------------------------------
 RUN pip install --no-cache-dir --break-system-packages \
-      torch --index-url https://download.pytorch.org/whl/cu129 \
+      torch --index-url https://download.pytorch.org/whl/cu130 \
  || pip install --no-cache-dir --break-system-packages \
-      torch --index-url https://download.pytorch.org/whl/cu128
+      torch --index-url https://download.pytorch.org/whl/cu129
 
 # numpy<2 is required at runtime by torch.distributed.all_gather_object
 # (DeepEP V2's ElasticBuffer.__init__ calls it from get_nccl_comm_handle).
@@ -171,9 +180,11 @@ RUN set -eux; \
     rm -f /lib/x86_64-linux-gnu/libnccl.so* /usr/lib/x86_64-linux-gnu/libnccl.so*; \
     ldconfig
 
+# Redeclare the global NCCL pin ARG inside this stage so RUN can substitute it.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu13>=2.30.4
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages --no-deps \
-      "nvidia-nccl-cu13>=2.30.4"; \
+      "${NVIDIA_NCCL_PIN}"; \
     NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
     echo "NCCL_LIB=${NCCL_LIB}"; \
     test -n "${NCCL_LIB}"; \
@@ -194,7 +205,7 @@ RUN set -eux; \
 # The wheel only ships libnvshmem_host.so.X (versioned), but DeepEP's link
 # line uses `-l:libnvshmem_host.so` (unversioned). Create the symlink.
 RUN pip install --no-cache-dir --break-system-packages \
-      "nvidia-nvshmem-cu12>=3.3.9" \
+      "nvidia-nvshmem-cu13>=3.3.9" \
  && NVSHMEM_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nvshmem/lib' -type d 2>/dev/null | head -1)" \
  && test -n "${NVSHMEM_LIB}" && test -d "${NVSHMEM_LIB}" \
  && ls "${NVSHMEM_LIB}" \
@@ -214,6 +225,7 @@ RUN pip install --no-cache-dir --break-system-packages \
 # matching 2.30.4 headers. The plugin's ncclGinPlugin_v11/v12 symbols must
 # match the NCCL it is loaded alongside, or DeepEP's railedGinType check
 # (see csrc/kernels/backend/nccl.cu in DeepEP V2) fails.
+# (Wave 13 cu13 cascade; supersedes Wave 9b cu12 unification.)
 # -----------------------------------------------------------------------------
 ARG AWS_OFI_NCCL_SHA=6e504db3403931cde43a2335adcc73fbc69cccac
 RUN set -eux; \
@@ -249,6 +261,10 @@ RUN set -eux; \
 # reviewability. When DeepEP PR #612 merges upstream we flip DEEPEP_FORK to
 # vanilla and drop ./patches/.
 # -----------------------------------------------------------------------------
+# Canonical values live in ../pins.env at the repo root. Both docker/build.sh
+# and ci/buildspec.yml source that file and pass the values via --build-arg,
+# which overrides these defaults. The hardcoded values below are retained as
+# a legacy-safety fallback so `docker build ...` still works in an emergency.
 ARG DEEPEP_FORK=https://github.com/dmvevents/DeepEP-1.git
 ARG DEEPEP_BRANCH=aws-efa-auto-qp-cap-v2
 ARG DEEPEP_SHA=146cc356aa00c39ac1590c05775e05b0f031e70c
@@ -298,6 +314,9 @@ FROM base-${BUILD_MODE} AS release
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# Redeclare the global NCCL pin ARG inside this stage so RUN can substitute it.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu13>=2.30.4
+
 # -----------------------------------------------------------------------------
 # vLLM with PR #41183 applied (via fork pin)
 #
@@ -332,17 +351,17 @@ RUN set -eux; \
     VLLM_USE_PRECOMPILED=1 pip install --no-cache-dir --break-system-packages -e .
 
 # -----------------------------------------------------------------------------
-# G1 (Wave 6 fix, baked in Wave 7a): realign torchvision to cu129.
+# G1 (Wave 6 fix, Wave 13 cu13 cascade): ensure torchvision matches base cu13.
 # vLLM's VLLM_USE_PRECOMPILED=1 install pulls a torch+torchvision pair whose
-# torchvision is linked against CUDA 13 shared libs. The base image ships
-# CUDA 12.9 runtime (nvidia/cuda:12.9.0-devel-ubuntu24.04), so torchvision
-# fails at import with "undefined symbol / libcudart.so.13 not found" during
-# the transformers import chain that vLLM serve triggers on first request.
-# Wave 6 worked around this at runtime with a pip reinstall on-pod. Moving
-# that step here eliminates the on-pod workaround.
+# torchvision is linked against CUDA 13 shared libs. Base image v0.2.1-sm90a
+# is nvidia/cuda:13.0.0-devel-ubuntu24.04 with libcudart.so.13 native, so we
+# realign torchvision to the cu130 index to guarantee ABI match. (Under
+# <=Wave 11 this step realigned to cu129 to match the old CUDA 12.9 base;
+# that mismatched the vLLM precompiled kernels and caused torchvision to
+# fail "libcudart.so.13 not found" at import time.)
 # -----------------------------------------------------------------------------
 RUN pip install --no-cache-dir --break-system-packages --force-reinstall --no-deps \
-      --index-url https://download.pytorch.org/whl/cu129 \
+      --index-url https://download.pytorch.org/whl/cu130 \
       torchvision
 
 # -----------------------------------------------------------------------------
@@ -372,23 +391,47 @@ RUN set -eux; \
       || echo "deep_gemm not importable; documented fallback applies"
 
 # -----------------------------------------------------------------------------
-# Wave 7c.3 — force torch to cu129 AFTER vLLM install so its transitive
-# cu130 torch (if any) is overridden. Base image's deep_ep 146cc356 is
-# compiled against cu129 torch, so the .so is ABI-compatible once torch is
-# cu129. No deep_ep rebuild needed.
+# Wave 13 cu13 cascade: unify torch to cu130 to match base image cu13 runtime.
+# vLLM VLLM_USE_PRECOMPILED=1 already installs torch cu130 by default now, but
+# --force-reinstall pins the index-url to cu130 as belt-and-suspenders. The
+# ABI chain is now: base libcudart.so.13 -> torch cu130 -> vllm._C cu13 ->
+# deep_ep _C.so (built against torch cu130 in base v0.2.1-sm90a) ->
+# nvidia-nccl-cu13 2.30.4. NO cu12 anywhere.
+#
+# HISTORICAL: Wave 7c.3 pinned torch to cu129 + Wave 9b pinned NCCL to
+# nvidia-nccl-cu12 to match the old CUDA 12.9 base. Wave 11 cluster-test
+# exposed the torch/vllm._C cu13 wheel vs. cu12 base ABI split that caused
+# `invalid device ordinal` at first MoE dispatch. Wave 13 rebuilds the base
+# on CUDA 13 and drops all cu12 pins.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages --force-reinstall \
-      --index-url https://download.pytorch.org/whl/cu129 \
+      --index-url https://download.pytorch.org/whl/cu130 \
       torch; \
-    python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
-    pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
+    python3 -c "import torch; assert '+cu130' in torch.__version__, torch.__version__; print('torch realigned to cu130:', torch.__version__)"; \
+    # torch cu130 wheel already pins nvidia-nccl-cu13 at a matching or newer
+    # version. Reassert the 2.30.4 minimum here to guard against a wheel
+    # downgrade. DeepEP V2 _C.so was compiled against 2.30+ symbols
+    # (`ncclCommQueryProperties`) so a 2.28.x downgrade would break at load.
     pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
-      "nvidia-nccl-cu13>=2.30.4"; \
+      "${NVIDIA_NCCL_PIN}"; \
     NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
     test -n "${NCCL_LIB}"; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
     ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
+    ldconfig; \
+    # Wave 13 NVSHMEM guard: torch cu130 / vLLM precompiled wheel pins
+    # nvidia-nvshmem-cu13==3.4.5 and downgrades the base image's 3.6.5.
+    # DeepEP V2 _C.so in v0.2.1-sm90a was linked against NVSHMEM 3.6.x
+    # (symbol `nvshmem_selected_device_transport, version NVSHMEM` was
+    # added in 3.6). Reinstall >= 3.6.0 after torch/vLLM to restore the
+    # base ABI and re-link the unversioned libnvshmem_host.so symlink.
+    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+      "nvidia-nvshmem-cu13>=3.6.0"; \
+    NVSHMEM_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nvshmem/lib' -type d 2>/dev/null | head -1)"; \
+    test -n "${NVSHMEM_LIB}"; \
+    HOST_SO="$(ls "${NVSHMEM_LIB}"/libnvshmem_host.so.* | head -1)"; \
+    ln -sf "$(basename "${HOST_SO}")" "${NVSHMEM_LIB}/libnvshmem_host.so"; \
     ldconfig; \
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.

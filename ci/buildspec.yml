@@ -29,7 +29,10 @@ version: 0.2
 env:
   variables:
     DOCKER_BUILDKIT: "1"
-    BASE_IMAGE_FAST: "ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a"
+    # Fallback default. pins.env at repo root is the canonical source and
+    # overrides this value in pre_build (Wave 9b cu12 unification bumped the
+    # canonical tag from v0.1.1-sm90a -> v0.1.2-sm90a).
+    BASE_IMAGE_FAST: "ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.2-sm90a"
     # CONTRACT: docker/preflight.sh prints a single line of the form
     # "<pass>/<total> checks PASS" (currently "8/8 checks PASS") at the
     # end of a healthy run. The greps below match this exact shape. If
@@ -71,6 +74,19 @@ phases:
         fi
       - GIT_SHA_SHORT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
       - echo "[pre_build] GIT_SHA_SHORT=${GIT_SHA_SHORT}"
+      # Wave 7d-1 OKR-1 + Wave 9b: source canonical pins from pins.env at the
+      # repo root BEFORE pulling the base image. Single source of truth for
+      # fork/branch/SHA + NCCL pin + base-image tag so a rebase of
+      # dmvevents/DeepEP-1@aws-efa-auto-qp-cap-v2 or a CUDA-runtime unification
+      # only needs to touch one file per consumer repo. Dockerfile retains
+      # hardcoded ARG defaults as fallback.
+      - 'test -f pins.env || (echo "ERROR: pins.env missing at repo root" && exit 2)'
+      - . ./pins.env
+      - echo "[pre_build] pins.env DEEPEP_FORK=${DEEPEP_FORK:-<unset>}"
+      - echo "[pre_build] pins.env DEEPEP_BRANCH=${DEEPEP_BRANCH:-<unset>}"
+      - echo "[pre_build] pins.env DEEPEP_SHA=${DEEPEP_SHA:-<unset>}"
+      - echo "[pre_build] pins.env NVIDIA_NCCL_PIN=${NVIDIA_NCCL_PIN:-<unset>}"
+      - echo "[pre_build] pins.env BASE_IMAGE_FAST=${BASE_IMAGE_FAST:-<unset>}"
       - echo "[pre_build] Pulling base image for fast path"
       - 'docker pull "${BASE_IMAGE_FAST}" || (echo "ERROR: cannot pull ${BASE_IMAGE_FAST}. Check GHCR auth or flip package to public." && exit 3)'
 
@@ -86,6 +102,11 @@ phases:
         docker build \
           -f docker/Dockerfile \
           --build-arg BUILD_MODE=fast \
+          --build-arg BASE_IMAGE_FAST="${BASE_IMAGE_FAST}" \
+          --build-arg NVIDIA_NCCL_PIN="${NVIDIA_NCCL_PIN}" \
+          --build-arg DEEPEP_FORK="${DEEPEP_FORK}" \
+          --build-arg DEEPEP_BRANCH="${DEEPEP_BRANCH}" \
+          --build-arg DEEPEP_SHA="${DEEPEP_SHA}" \
           -t "${FAST_TAG_SHA}" \
           -t "${FAST_TAG_LATEST}" \
           .
@@ -112,6 +133,10 @@ phases:
         docker build \
           -f docker/Dockerfile \
           --build-arg BUILD_MODE=vanilla \
+          --build-arg NVIDIA_NCCL_PIN="${NVIDIA_NCCL_PIN}" \
+          --build-arg DEEPEP_FORK="${DEEPEP_FORK}" \
+          --build-arg DEEPEP_BRANCH="${DEEPEP_BRANCH}" \
+          --build-arg DEEPEP_SHA="${DEEPEP_SHA}" \
           -t "${VANILLA_TAG}" \
           .
       - echo "[build] Running preflight inside ${VANILLA_TAG}"

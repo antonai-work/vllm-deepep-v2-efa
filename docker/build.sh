@@ -111,11 +111,35 @@ else
   echo "[build.sh] Base image:    nvidia/cuda:12.9.0-devel-ubuntu24.04 (inlined base stack)"
 fi
 echo "[build.sh] Patches:       $(ls "${REPO_ROOT}/patches/"*.patch 2>/dev/null | wc -l) present (reviewable artifacts)"
+
+# Wave 7d-1 OKR-1: source canonical pins from pins.env at the repo root.
+# Single source of truth for fork/branch/SHA so a rebase of
+# dmvevents/DeepEP-1@aws-efa-auto-qp-cap-v2 only needs to touch one file
+# per consumer repo. Dockerfile retains hardcoded ARG defaults as fallback.
+PINS_ENV="${REPO_ROOT}/pins.env"
+PIN_BUILD_ARGS=()
+if [ -f "${PINS_ENV}" ]; then
+  # shellcheck disable=SC1090
+  . "${PINS_ENV}"
+  echo "[build.sh] pins.env:      ${PINS_ENV}"
+  echo "[build.sh]   DEEPEP_FORK=${DEEPEP_FORK:-<unset>}"
+  echo "[build.sh]   DEEPEP_BRANCH=${DEEPEP_BRANCH:-<unset>}"
+  echo "[build.sh]   DEEPEP_SHA=${DEEPEP_SHA:-<unset>}"
+  for VAR in DEEPEP_FORK DEEPEP_BRANCH DEEPEP_SHA; do
+    eval "VAL=\${${VAR}:-}"
+    if [ -n "${VAL}" ]; then
+      PIN_BUILD_ARGS+=(--build-arg "${VAR}=${VAL}")
+    fi
+  done
+else
+  echo "[build.sh] pins.env:      <missing at ${PINS_ENV}>, using Dockerfile ARG defaults"
+fi
 echo ""
 
 DOCKER_BUILDKIT=1 docker build \
   -f "${DOCKERFILE}" \
   --build-arg "BUILD_MODE=${BUILD_MODE}" \
+  "${PIN_BUILD_ARGS[@]}" \
   -t "${IMAGE_TAG}" \
   "${EXTRA_ARGS[@]}" \
   "${REPO_ROOT}"
