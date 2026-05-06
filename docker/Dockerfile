@@ -30,7 +30,7 @@
 #   NCCL                 nvidia-nccl-cu13 >= 2.30.4               vanilla
 #   GDRCopy              v2.5.1                                   vanilla
 #   DeepEP V2            dmvevents/DeepEP-1 @ aws-efa-auto-qp-cap-v2
-#                        SHA c84dcac613c8df743a6487a312bbc966c745c600
+#                        SHA 146cc356aa00c39ac1590c05775e05b0f031e70c
 #                        (b306af0 + 3 commits = PR #612)          OUR PATCHES
 #   vLLM                 github.com/tlrmchlsmth/vllm @            vLLM PR #41183
 #                        deepep-v2-integration, SHA 6d7a3fab
@@ -251,7 +251,7 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 ARG DEEPEP_FORK=https://github.com/dmvevents/DeepEP-1.git
 ARG DEEPEP_BRANCH=aws-efa-auto-qp-cap-v2
-ARG DEEPEP_SHA=c84dcac613c8df743a6487a312bbc966c745c600
+ARG DEEPEP_SHA=146cc356aa00c39ac1590c05775e05b0f031e70c
 
 RUN set -eux; \
     git clone --recurse-submodules "${DEEPEP_FORK}" /opt/DeepEP; \
@@ -438,7 +438,7 @@ LABEL org.opencontainers.image.title="vllm-deepep-v2-efa" \
       org.opencontainers.image.licenses="Apache-2.0" \
       build.mode="${BUILD_MODE}" \
       deepep.branch="aws-efa-auto-qp-cap-v2" \
-      deepep.sha="c84dcac613c8df743a6487a312bbc966c745c600" \
+      deepep.sha="146cc356aa00c39ac1590c05775e05b0f031e70c" \
       vllm.repo_url="https://github.com/tlrmchlsmth/vllm.git" \
       vllm.branch="deepep-v2-integration" \
       vllm.sha="6d7a3fab28f58d2e73f3c650d24c7297475a7422" \
