@@ -371,27 +371,44 @@ RUN set -eux; \
     python3 -c "import deep_gemm; print('deep_gemm OK:', deep_gemm.__file__)" 2>&1 \
       || echo "deep_gemm not importable; documented fallback applies"
 
-# PyTorch's torch wheel pulled in nvidia-nccl-cu12 as a dep and may have
-# clobbered the cu13 2.30.4 symlink during vLLM install. Restore it, and
-# rebuild DeepEP V2 against torch's ABI so _C.so matches.
-# Pin torch to cu129 — base CUDA is 12.9, default pytorch.org wheel is cu130 (breaks deep_ep CUDA extension build).
+# Realign torch + deep_ep ABI after vLLM's VLLM_USE_PRECOMPILED=1 install,
+# which can pull a cu130 torch wheel (default on pytorch.org) and clobber
+# the cu129 torch + nvidia-nccl-cu13 2.30.4 symlink the base layer set up.
+#
+# The base image (BUILD_MODE=fast) already ships torch 2.9.1+cu129 AND a
+# deep_ep 146cc356 editable install built against it. If vLLM's precompiled
+# install kept torch==cu129 (common because the vLLM wheel is pinned), the
+# deep_ep rebuild is a pure waste that can fail if transient deps shifted
+# (Wave 7c.1 symptom: nvcc fails under the reinstalled torch+cu129 combo).
+#
+# Strategy: only rebuild if torch version actually drifted away from
+# cu129. A matching torch means the base image's deep_ep .so is still
+# valid.
 RUN set -eux; \
-    pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
-    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
-      "nvidia-nccl-cu13>=2.30.4"; \
-    pip install --no-cache-dir --break-system-packages --force-reinstall \
-      --index-url https://download.pytorch.org/whl/cu129 \
-      torch; \
-    NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
-    test -n "${NCCL_LIB}"; \
-    SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
-    ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
-    ldconfig; \
-    cd /opt/DeepEP; \
-    export LIBRARY_PATH="${NCCL_LIB}:${LIBRARY_PATH:-}"; \
-    export TORCH_CUDA_ARCH_LIST="9.0"; \
-    export MAX_JOBS="$(nproc)"; \
-    pip install --no-build-isolation --break-system-packages --force-reinstall --no-deps -e .; \
+    CURRENT_TORCH="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo MISSING)"; \
+    echo "post-vLLM torch: ${CURRENT_TORCH}"; \
+    if [[ "${CURRENT_TORCH}" == *"+cu129"* ]]; then \
+      echo "torch is already cu129; skipping force-reinstall + deep_ep rebuild"; \
+      echo "(base image's deep_ep 146cc356 .so is ABI-compatible with current torch)"; \
+    else \
+      echo "torch drifted to ${CURRENT_TORCH}; realigning to cu129 + rebuilding deep_ep"; \
+      pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
+      pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+        "nvidia-nccl-cu13>=2.30.4"; \
+      pip install --no-cache-dir --break-system-packages --force-reinstall \
+        --index-url https://download.pytorch.org/whl/cu129 \
+        torch; \
+      NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
+      test -n "${NCCL_LIB}"; \
+      SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
+      ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
+      ldconfig; \
+      cd /opt/DeepEP; \
+      export LIBRARY_PATH="${NCCL_LIB}:${LIBRARY_PATH:-}"; \
+      export TORCH_CUDA_ARCH_LIST="9.0"; \
+      export MAX_JOBS="$(nproc)"; \
+      pip install --no-build-isolation --break-system-packages --force-reinstall --no-deps -e .; \
+    fi; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
     # rather than `import`, because a full import pulls in transformers ->
