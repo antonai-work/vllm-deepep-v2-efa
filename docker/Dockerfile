@@ -176,6 +176,8 @@ RUN set -eux; \
     rm -f /lib/x86_64-linux-gnu/libnccl.so* /usr/lib/x86_64-linux-gnu/libnccl.so*; \
     ldconfig
 
+# Redeclare the global NCCL pin ARG inside this stage so RUN can substitute it.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu12>=2.30.4
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages --no-deps \
       "${NVIDIA_NCCL_PIN}"; \
@@ -307,6 +309,9 @@ FROM base-${BUILD_MODE} AS release
 
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Redeclare the global NCCL pin ARG inside this stage so RUN can substitute it.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu12>=2.30.4
 
 # -----------------------------------------------------------------------------
 # vLLM with PR #41183 applied (via fork pin)
