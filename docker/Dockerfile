@@ -382,6 +382,14 @@ RUN set -eux; \
       --index-url https://download.pytorch.org/whl/cu129 \
       torch; \
     python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
+    pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
+    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+      "nvidia-nccl-cu13>=2.30.4"; \
+    NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
+    test -n "${NCCL_LIB}"; \
+    SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
+    ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
+    ldconfig; \
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
