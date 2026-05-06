@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # Dual-path build:
-#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
+#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
 #                         (Wave-1 published base image, same DeepEP V2 + EFA
 #                          stack as below, skips the 40 minute cold build)
 #   BUILD_MODE=vanilla -> inlines the full 240 line base stack from
@@ -30,7 +30,7 @@
 #   NCCL                 nvidia-nccl-cu13 >= 2.30.4               vanilla
 #   GDRCopy              v2.5.1                                   vanilla
 #   DeepEP V2            dmvevents/DeepEP-1 @ aws-efa-auto-qp-cap-v2
-#                        SHA 146cc356aa00c39ac1590c05775e05b0f031e70c
+#                        SHA c84dcac613c8df743a6487a312bbc966c745c600
 #                        (b306af0 + 3 commits = PR #612)          OUR PATCHES
 #   vLLM                 github.com/tlrmchlsmth/vllm @            vLLM PR #41183
 #                        deepep-v2-integration, SHA 6d7a3fab
@@ -49,7 +49,7 @@
 # =============================================================================
 
 ARG BUILD_MODE=fast
-ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
 ARG BASE_IMAGE_VANILLA=nvidia/cuda:12.9.0-devel-ubuntu24.04
 
 # =============================================================================
@@ -251,7 +251,7 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 ARG DEEPEP_FORK=https://github.com/dmvevents/DeepEP-1.git
 ARG DEEPEP_BRANCH=aws-efa-auto-qp-cap-v2
-ARG DEEPEP_SHA=146cc356aa00c39ac1590c05775e05b0f031e70c
+ARG DEEPEP_SHA=c84dcac613c8df743a6487a312bbc966c745c600
 
 RUN set -eux; \
     git clone --recurse-submodules "${DEEPEP_FORK}" /opt/DeepEP; \
@@ -331,57 +331,10 @@ RUN set -eux; \
     # Use precompiled kernels so the vLLM install is ~5 min, not ~60.
     VLLM_USE_PRECOMPILED=1 pip install --no-cache-dir --break-system-packages -e .
 
-# -----------------------------------------------------------------------------
-# G1 (Wave 6 fix, baked in Wave 7a): realign torchvision to cu129.
-# vLLM's VLLM_USE_PRECOMPILED=1 install pulls a torch+torchvision pair whose
-# torchvision is linked against CUDA 13 shared libs. The base image ships
-# CUDA 12.9 runtime (nvidia/cuda:12.9.0-devel-ubuntu24.04), so torchvision
-# fails at import with "undefined symbol / libcudart.so.13 not found" during
-# the transformers import chain that vLLM serve triggers on first request.
-# Wave 6 worked around this at runtime with a pip reinstall on-pod. Moving
-# that step here eliminates the on-pod workaround.
-# -----------------------------------------------------------------------------
-RUN pip install --no-cache-dir --break-system-packages --force-reinstall --no-deps \
-      --index-url https://download.pytorch.org/whl/cu129 \
-      torchvision
-
-# -----------------------------------------------------------------------------
-# G2 (Wave 6 fix, baked in Wave 7a): install deep_gemm for Qwen3-FP8 MoE.
-# vLLM's DeepEP V2 FP8 MoE kernel path requires the `deep_gemm` library for
-# per-expert FP8 GEMMs; without it vLLM falls back to bfloat16 with
-# VLLM_USE_DEEP_GEMM=0. PyPI does not publish a pre-built deep_gemm wheel
-# as of 2026-05-05 (upstream DeepSeek deep_gemm is source-only, SM90
-# required). We try PyPI first for forward-compatibility, then fall back
-# to a git install against the upstream repo. If the source build fails
-# (e.g. CI host lacks CUDA), we emit a clear log line and keep the image
-# usable: FP8 MoE will then require VLLM_USE_DEEP_GEMM=0 + bfloat16 at
-# runtime (documented in docs/UPSTREAM-STATUS.md).
-# -----------------------------------------------------------------------------
+# PyTorch's torch wheel pulled in nvidia-nccl-cu12 as a dep and may have
+# clobbered the cu13 2.30.4 symlink during vLLM install. Restore it, and
+# rebuild DeepEP V2 against torch's ABI so _C.so matches.
 RUN set -eux; \
-    if pip install --no-cache-dir --break-system-packages deep_gemm 2>/dev/null; then \
-      echo "deep_gemm: installed from PyPI"; \
-    elif pip install --no-cache-dir --break-system-packages \
-         "git+https://github.com/deepseek-ai/DeepGEMM.git" 2>/dev/null; then \
-      echo "deep_gemm: installed from git source"; \
-    else \
-      echo "WARNING: deep_gemm not installable on this build host;"; \
-      echo "         FP8 MoE will require VLLM_USE_DEEP_GEMM=0 + bfloat16 fallback."; \
-      echo "         See docs/UPSTREAM-STATUS.md."; \
-    fi; \
-    python3 -c "import deep_gemm; print('deep_gemm OK:', deep_gemm.__file__)" 2>&1 \
-      || echo "deep_gemm not importable; documented fallback applies"
-
-# -----------------------------------------------------------------------------
-# Wave 7c.3 — force torch to cu129 AFTER vLLM install so its transitive
-# cu130 torch (if any) is overridden. Base image's deep_ep 146cc356 is
-# compiled against cu129 torch, so the .so is ABI-compatible once torch is
-# cu129. No deep_ep rebuild needed.
-# -----------------------------------------------------------------------------
-RUN set -eux; \
-    pip install --no-cache-dir --break-system-packages --force-reinstall \
-      --index-url https://download.pytorch.org/whl/cu129 \
-      torch; \
-    python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
     pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
     pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
       "nvidia-nccl-cu13>=2.30.4"; \
@@ -390,7 +343,11 @@ RUN set -eux; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
     ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
     ldconfig; \
-    python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
+    cd /opt/DeepEP; \
+    export LIBRARY_PATH="${NCCL_LIB}:${LIBRARY_PATH:-}"; \
+    export TORCH_CUDA_ARCH_LIST="9.0"; \
+    export MAX_JOBS="$(nproc)"; \
+    pip install --no-build-isolation --break-system-packages --force-reinstall --no-deps -e .; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
     # rather than `import`, because a full import pulls in transformers ->
@@ -400,7 +357,8 @@ RUN set -eux; \
     python3 -c "from vllm.utils.import_utils import has_deep_ep_v2; print('has_deep_ep_v2 symbol OK')"; \
     grep -q '^class DeepEPV2PrepareAndFinalize' \
       /opt/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py \
-      && echo 'DeepEPV2PrepareAndFinalize class present in source'
+      && echo 'DeepEPV2PrepareAndFinalize class present in source'; \
+    python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"
 
 # -----------------------------------------------------------------------------
 # NO-SHIM INVARIANT: this image explicitly has no /opt/api-shim and no
@@ -440,7 +398,7 @@ LABEL org.opencontainers.image.title="vllm-deepep-v2-efa" \
       org.opencontainers.image.licenses="Apache-2.0" \
       build.mode="${BUILD_MODE}" \
       deepep.branch="aws-efa-auto-qp-cap-v2" \
-      deepep.sha="146cc356aa00c39ac1590c05775e05b0f031e70c" \
+      deepep.sha="c84dcac613c8df743a6487a312bbc966c745c600" \
       vllm.repo_url="https://github.com/tlrmchlsmth/vllm.git" \
       vllm.branch="deepep-v2-integration" \
       vllm.sha="6d7a3fab28f58d2e73f3c650d24c7297475a7422" \
