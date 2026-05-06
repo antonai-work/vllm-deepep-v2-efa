@@ -118,7 +118,7 @@ comes from:
 
 | Aspect | `--mode fast` | `--mode vanilla` |
 |---|---|---|
-| Base stage | `FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a` | `FROM nvidia/cuda:12.9.0-devel-ubuntu24.04`, 240 lines of base stack inlined verbatim from `antonai-work/deepep-v2-efa-base/Dockerfile` |
+| Base stage | `FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a` | `FROM nvidia/cuda:12.9.0-devel-ubuntu24.04`, 240 lines of base stack inlined verbatim from `antonai-work/deepep-v2-efa-base/Dockerfile` |
 | GHCR dependency | Yes (public or PAT with `read:packages`) | No |
 | Cold build time | ~10 min (mostly vLLM install + rebuild of DeepEP against torch ABI) | ~40 min (also compiles aws-ofi-nccl and DeepEP from source) |
 | Use case | Day-to-day iteration, CI pushes to ECR | Offline reproducibility, audit, clean-room rebuild |
