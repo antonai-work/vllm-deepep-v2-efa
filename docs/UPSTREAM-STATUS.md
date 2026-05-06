@@ -97,6 +97,32 @@ correct on a Gin-capable fabric.
 - Delete `patches/vllm-pr41183-deepep-v2.diff`.
 - Remove this section from `UPSTREAM-STATUS.md`.
 
+## Known limit: `deep_gemm` for FP8 MoE
+
+vLLM's DeepEP V2 FP8 MoE kernel path calls into the `deep_gemm` library
+for per-expert FP8 GEMMs. There is no pre-built `deep_gemm` wheel on
+PyPI as of 2026-05-05; the upstream `deepseek-ai/DeepGEMM` repo is
+source-only (SM90 build required).
+
+The Wave 7a `docker/Dockerfile` attempts, in order:
+1. `pip install deep_gemm` (PyPI)
+2. `pip install git+https://github.com/deepseek-ai/DeepGEMM.git`
+3. Log a warning and continue if both fail.
+
+When `deep_gemm` is absent, Qwen3-FP8 MoE inference falls back to
+bfloat16 at runtime via:
+
+```
+VLLM_USE_DEEP_GEMM=0 \
+  vllm serve Qwen/Qwen3-30B-A3B --dtype bfloat16 ...
+```
+
+This fallback is functional and matches the Wave 6 validated path
+(Run #10: 24 tokens Qwen3-FP8 DP=16 EP=16 over 2-node EFA with
+`VLLM_USE_DEEP_GEMM=0`). Upgrade path: when `deep_gemm` gets a PyPI
+wheel, the Dockerfile will auto-pick it up and FP8 native kernels
+become available with no user-side changes.
+
 ## Related issues and PRs (for reviewers unfamiliar with the context)
 
 - **DeepEP V2 release**:

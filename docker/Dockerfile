@@ -331,6 +331,46 @@ RUN set -eux; \
     # Use precompiled kernels so the vLLM install is ~5 min, not ~60.
     VLLM_USE_PRECOMPILED=1 pip install --no-cache-dir --break-system-packages -e .
 
+# -----------------------------------------------------------------------------
+# G1 (Wave 6 fix, baked in Wave 7a): realign torchvision to cu129.
+# vLLM's VLLM_USE_PRECOMPILED=1 install pulls a torch+torchvision pair whose
+# torchvision is linked against CUDA 13 shared libs. The base image ships
+# CUDA 12.9 runtime (nvidia/cuda:12.9.0-devel-ubuntu24.04), so torchvision
+# fails at import with "undefined symbol / libcudart.so.13 not found" during
+# the transformers import chain that vLLM serve triggers on first request.
+# Wave 6 worked around this at runtime with a pip reinstall on-pod. Moving
+# that step here eliminates the on-pod workaround.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir --break-system-packages --force-reinstall --no-deps \
+      --index-url https://download.pytorch.org/whl/cu129 \
+      torchvision
+
+# -----------------------------------------------------------------------------
+# G2 (Wave 6 fix, baked in Wave 7a): install deep_gemm for Qwen3-FP8 MoE.
+# vLLM's DeepEP V2 FP8 MoE kernel path requires the `deep_gemm` library for
+# per-expert FP8 GEMMs; without it vLLM falls back to bfloat16 with
+# VLLM_USE_DEEP_GEMM=0. PyPI does not publish a pre-built deep_gemm wheel
+# as of 2026-05-05 (upstream DeepSeek deep_gemm is source-only, SM90
+# required). We try PyPI first for forward-compatibility, then fall back
+# to a git install against the upstream repo. If the source build fails
+# (e.g. CI host lacks CUDA), we emit a clear log line and keep the image
+# usable: FP8 MoE will then require VLLM_USE_DEEP_GEMM=0 + bfloat16 at
+# runtime (documented in docs/UPSTREAM-STATUS.md).
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    if pip install --no-cache-dir --break-system-packages deep_gemm 2>/dev/null; then \
+      echo "deep_gemm: installed from PyPI"; \
+    elif pip install --no-cache-dir --break-system-packages \
+         "git+https://github.com/deepseek-ai/DeepGEMM.git" 2>/dev/null; then \
+      echo "deep_gemm: installed from git source"; \
+    else \
+      echo "WARNING: deep_gemm not installable on this build host;"; \
+      echo "         FP8 MoE will require VLLM_USE_DEEP_GEMM=0 + bfloat16 fallback."; \
+      echo "         See docs/UPSTREAM-STATUS.md."; \
+    fi; \
+    python3 -c "import deep_gemm; print('deep_gemm OK:', deep_gemm.__file__)" 2>&1 \
+      || echo "deep_gemm not importable; documented fallback applies"
+
 # PyTorch's torch wheel pulled in nvidia-nccl-cu12 as a dep and may have
 # clobbered the cu13 2.30.4 symlink during vLLM install. Restore it, and
 # rebuild DeepEP V2 against torch's ABI so _C.so matches.
