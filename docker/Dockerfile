@@ -374,10 +374,14 @@ RUN set -eux; \
 # PyTorch's torch wheel pulled in nvidia-nccl-cu12 as a dep and may have
 # clobbered the cu13 2.30.4 symlink during vLLM install. Restore it, and
 # rebuild DeepEP V2 against torch's ABI so _C.so matches.
+# Pin torch to cu129 — base CUDA is 12.9, default pytorch.org wheel is cu130 (breaks deep_ep CUDA extension build).
 RUN set -eux; \
     pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
     pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
       "nvidia-nccl-cu13>=2.30.4"; \
+    pip install --no-cache-dir --break-system-packages --force-reinstall \
+      --index-url https://download.pytorch.org/whl/cu129 \
+      torch; \
     NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
     test -n "${NCCL_LIB}"; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
