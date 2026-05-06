@@ -50,11 +50,11 @@ phases:
 
   pre_build:
     commands:
-      - echo "[pre_build] Starting $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      - echo "[pre_build] CodeBuild project -> AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}, AWS_REGION=${AWS_REGION}, ECR_REPO=${ECR_REPO}"
-      - test -n "${AWS_ACCOUNT_ID}" || (echo "ERROR: AWS_ACCOUNT_ID unset" && exit 2)
-      - test -n "${AWS_REGION}"     || (echo "ERROR: AWS_REGION unset" && exit 2)
-      - test -n "${ECR_REPO}"       || (echo "ERROR: ECR_REPO unset" && exit 2)
+      - 'echo "[pre_build] Starting $(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+      - 'echo "[pre_build] CodeBuild project AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID} AWS_REGION=${AWS_REGION} ECR_REPO=${ECR_REPO}"'
+      - 'test -n "${AWS_ACCOUNT_ID}" || (echo "ERROR: AWS_ACCOUNT_ID unset" && exit 2)'
+      - 'test -n "${AWS_REGION}"     || (echo "ERROR: AWS_REGION unset" && exit 2)'
+      - 'test -n "${ECR_REPO}"       || (echo "ERROR: ECR_REPO unset" && exit 2)'
       - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
       - echo "[pre_build] ECR_REGISTRY=${ECR_REGISTRY}"
       - echo "[pre_build] Logging in to ECR"
@@ -72,12 +72,12 @@ phases:
       - GIT_SHA_SHORT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
       - echo "[pre_build] GIT_SHA_SHORT=${GIT_SHA_SHORT}"
       - echo "[pre_build] Pulling base image for fast path"
-      - docker pull "${BASE_IMAGE_FAST}" || (echo "ERROR: cannot pull ${BASE_IMAGE_FAST}. Check GHCR auth or flip package to public." && exit 3)
+      - 'docker pull "${BASE_IMAGE_FAST}" || (echo "ERROR: cannot pull ${BASE_IMAGE_FAST}. Check GHCR auth or flip package to public." && exit 3)'
 
   build:
     commands:
       - echo "===================================================================="
-      - echo "[build] Phase 1/2: BUILD_MODE=fast"
+      - 'echo "[build] Phase 1/2: BUILD_MODE=fast"'
       - echo "===================================================================="
       - FAST_TAG_SHA="${ECR_REGISTRY}/${ECR_REPO}:fast-${GIT_SHA_SHORT}"
       - FAST_TAG_LATEST="${ECR_REGISTRY}/${ECR_REPO}:fast-latest"
@@ -104,7 +104,7 @@ phases:
           exit "${PF_RC}"
         fi
       - echo "===================================================================="
-      - echo "[build] Phase 2/2: BUILD_MODE=vanilla (validation-only, not pushed)"
+      - 'echo "[build] Phase 2/2: BUILD_MODE=vanilla (validation-only, not pushed)"'
       - echo "===================================================================="
       - VANILLA_TAG="vllm-deepep-v2-efa:vanilla-${GIT_SHA_SHORT}"
       - echo "[build] Building ${VANILLA_TAG}"
