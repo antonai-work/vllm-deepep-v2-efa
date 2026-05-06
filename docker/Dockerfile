@@ -27,7 +27,8 @@
 #   aws-ofi-nccl         6e504db3403931cde43a2335adcc73fbc69cccac vanilla
 #                        ("gin: Size active_put_signal to full sequence
 #                         number space", upstream fix 2026-04-24)
-#   NCCL                 nvidia-nccl-cu13 >= 2.30.4               vanilla
+#   NCCL                 nvidia-nccl-cu12 >= 2.30.4               vanilla
+#                        (Wave 9b cu12 unification, was cu13 in <=Wave 7c.4)
 #   GDRCopy              v2.5.1                                   vanilla
 #   DeepEP V2            dmvevents/DeepEP-1 @ aws-efa-auto-qp-cap-v2
 #                        SHA 146cc356aa00c39ac1590c05775e05b0f031e70c
@@ -49,8 +50,12 @@
 # =============================================================================
 
 ARG BUILD_MODE=fast
-ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.2-sm90a
 ARG BASE_IMAGE_VANILLA=nvidia/cuda:12.9.0-devel-ubuntu24.04
+# Wave 9b cu12 unification: single cu12 NCCL throughout (matches torch cu129 +
+# base-image NCCL + DeepEP .so). Supersedes the Wave 7c.4 cu13 realign that
+# caused Wave 8 "invalid device ordinal" crashes at first MoE dispatch.
+ARG NVIDIA_NCCL_PIN=nvidia-nccl-cu12>=2.30.4
 
 # =============================================================================
 # base-fast: FROM the prebuilt GHCR base image. Contains the full DeepEP V2 +
@@ -173,7 +178,7 @@ RUN set -eux; \
 
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages --no-deps \
-      "nvidia-nccl-cu13>=2.30.4"; \
+      "${NVIDIA_NCCL_PIN}"; \
     NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
     echo "NCCL_LIB=${NCCL_LIB}"; \
     test -n "${NCCL_LIB}"; \
@@ -210,10 +215,11 @@ RUN pip install --no-cache-dir --break-system-packages \
 # with "received count: 0" on AWS EFA once num_allocated_qps >= 5. Supersedes
 # our earlier out-of-tree ring-size patch.
 #
-# Must be built AFTER nvidia-nccl-cu13 pip install so --with-nccl finds
+# Must be built AFTER nvidia-nccl-cu12 pip install so --with-nccl finds
 # matching 2.30.4 headers. The plugin's ncclGinPlugin_v11/v12 symbols must
 # match the NCCL it is loaded alongside, or DeepEP's railedGinType check
 # (see csrc/kernels/backend/nccl.cu in DeepEP V2) fails.
+# (Wave 9b cu12 unification; was cu13 in <=Wave 7c.4.)
 # -----------------------------------------------------------------------------
 ARG AWS_OFI_NCCL_SHA=6e504db3403931cde43a2335adcc73fbc69cccac
 RUN set -eux; \
@@ -386,14 +392,12 @@ RUN set -eux; \
       --index-url https://download.pytorch.org/whl/cu129 \
       torch; \
     python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
-    pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
-    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
-      "nvidia-nccl-cu13>=2.30.4"; \
-    NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
-    test -n "${NCCL_LIB}"; \
-    SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
-    ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
-    ldconfig; \
+    # HISTORICAL: Wave 7c.4 previously inserted a cu13 realign cascade here (pip
+    # remove cu12, pip install cu13 wheel, relink libnccl.so). Wave 8 live-cluster
+    # validation proved that cascade caused "invalid device ordinal" at first MoE
+    # dispatch because torch cu129 is a cu12.9 build, not a cu13 build. Wave 9b
+    # removes the realign entirely: base image v0.1.2-sm90a now ships cu12 NCCL
+    # natively, so torch + DeepEP _C.so + NCCL all agree on cu12 throughout.
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
