@@ -249,6 +249,10 @@ RUN set -eux; \
 # reviewability. When DeepEP PR #612 merges upstream we flip DEEPEP_FORK to
 # vanilla and drop ./patches/.
 # -----------------------------------------------------------------------------
+# Canonical values live in ../pins.env at the repo root. Both docker/build.sh
+# and ci/buildspec.yml source that file and pass the values via --build-arg,
+# which overrides these defaults. The hardcoded values below are retained as
+# a legacy-safety fallback so `docker build ...` still works in an emergency.
 ARG DEEPEP_FORK=https://github.com/dmvevents/DeepEP-1.git
 ARG DEEPEP_BRANCH=aws-efa-auto-qp-cap-v2
 ARG DEEPEP_SHA=146cc356aa00c39ac1590c05775e05b0f031e70c
