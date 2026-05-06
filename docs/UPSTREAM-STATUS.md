@@ -4,14 +4,14 @@ Live tracking of the two upstream PRs this repo depends on. When
 both merge, this repo's `docker/Dockerfile` can drop the patch-apply
 and fork-clone steps and install vanilla upstream instead.
 
-Last updated: 2026-05-05.
+Last updated: 2026-05-06.
 
 ## Summary
 
 | Repo | PR | State | Estimate |
 |---|---|---|---|
-| [`deepseek-ai/DeepEP`](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN | Filed 2026-04-28, rebased + pinged 2026-05-05; waiting on maintainer review |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN | Filed 2026-04-29, 16 commits through 2026-05-04; author is a vLLM team member, actively iterating |
+| [`deepseek-ai/DeepEP`](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN, mergeable | Filed 2026-04-28, rebased + pinged 2026-05-05; waiting on maintainer review |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN, mergeable | Filed 2026-04-29, 16 commits through 2026-05-04; author is a vLLM team member, actively iterating |
 
 ## PR #612: DeepEP AWS EFA optimizations
 
@@ -20,7 +20,7 @@ Last updated: 2026-05-05.
   (3 commits on top of `deepseek-ai/DeepEP@main`)
 - **Filed**: 2026-04-28
 - **Last activity**: 2026-05-05 (rebase + courtesy ping)
-- **State**: OPEN, 0 reviews, 1 comment (maintainer pending)
+- **State**: OPEN, mergeable, 0 reviews, 1 comment (maintainer pending)
 
 ### Commits
 

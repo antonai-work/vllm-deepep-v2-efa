@@ -3,7 +3,7 @@
 **Reproducible DeepEP V2 MoE inference with vLLM on AWS EFA, built from
 vanilla upstream sources + one open vLLM PR + one open DeepEP PR.**
 
-**Status:** Dual-path Dockerfile verified locally 2026-05-05 (fast via GHCR base + vanilla inline); CodeBuild CI configured; 24-token chat completion validated on 2× p5.48xlarge H100 with DP=16 EP=16.
+**Status:** Dual-path Dockerfile verified locally 2026-05-06 (fast via GHCR base + vanilla inline); CodeBuild CI configured; 24-token chat completion validated on 2× p5.48xlarge H100 with DP=16 EP=16. Last validated 2026-05-06 Wave 13.
 
 This repo packages a complete multi-stage Docker build chain and a
 Kubernetes manifest that produces a working Qwen3-30B-A3B-FP8 MoE
@@ -18,9 +18,9 @@ NCCL Gin + EFA, with no V1-to-V2 compat shim in the serving path.
 
 | Repo | Purpose | Status |
 |---|---|---|
-| [deepep-v2-efa-base](https://github.com/antonai-work/deepep-v2-efa-base) | Base substrate (EFA + NCCL + DeepEP V2) | v0.1.0-sm90a released |
-| [nemo-rl-deepep-v2-efa](https://github.com/antonai-work/nemo-rl-deepep-v2-efa) | Training stack (Megatron-LM + NeMo-RL) | Dual-path build verified |
-| [vllm-deepep-v2-efa](https://github.com/antonai-work/vllm-deepep-v2-efa) | Inference stack (this repo) | Dual-path build verified |
+| [deepep-v2-efa-base](https://github.com/antonai-work/deepep-v2-efa-base) | Base substrate (EFA + NCCL + DeepEP V2) | v0.2.1-sm90a released |
+| [nemo-rl-deepep-v2-efa](https://github.com/antonai-work/nemo-rl-deepep-v2-efa) | Training stack (Megatron-LM + NeMo-RL) | Dual-path build verified 2026-05-06 |
+| [vllm-deepep-v2-efa](https://github.com/antonai-work/vllm-deepep-v2-efa) | Inference stack (this repo) | Dual-path build verified 2026-05-06 |
 
 Together, these three repos provide end-to-end DeepEP V2 MoE reproducibility on AWS EFA, from base substrate through training and inference.
 
@@ -60,17 +60,21 @@ Together, these three repos provide end-to-end DeepEP V2 MoE reproducibility on 
   CodeBuild pipeline that builds both modes, runs preflight in each
   image, and pushes the fast build to ECR.
 
+## Validation
+
+Wave 13 cu13-unified stack validation: [`docs/VALIDATION-WAVE13-CU13-CLUSTER-PASS.md`](docs/VALIDATION-WAVE13-CU13-CLUSTER-PASS.md). Captures 24-token chat completion without cu12/cu13 ABI crashes, NVSHMEM guard fix, and EFA traffic evidence. Image digest: `sha256:410157270f3fd86c8f5cac3cffe88d651ccc3b779f1c30c8d4092d8fa0e3d543`.
+
 ## Upstream PRs
 
 Five PRs filed 2026-04-28 through 2026-05-05, covering the full training + inference stack. All five are independent, EFA-specific, and safe on non-EFA fabrics:
 
-| Upstream repo | PR | Status (2026-05-05) | Applies to |
+| Upstream repo | PR | Status (2026-05-06) | Applies to |
 |---|---|---|---|
-| [deepseek-ai/DeepEP](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN, rebased 2026-05-05 | Base substrate (all frameworks) |
-| [vllm-project/vllm](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN, actively reviewed | Inference (this repo) |
-| [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) | [#4632](https://github.com/NVIDIA/Megatron-LM/pull/4632) | DRAFT | Training (sibling repo) |
-| [NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) | [#2410](https://github.com/NVIDIA-NeMo/RL/pull/2410) / [#2411](https://github.com/NVIDIA-NeMo/RL/pull/2411) | DRAFT | Training (sibling repo) |
-| [sgl-project/sglang](https://github.com/sgl-project/sglang) | [#24443](https://github.com/sgl-project/sglang/pull/24443) | DRAFT | Inference (this repo) |
+| [deepseek-ai/DeepEP](https://github.com/deepseek-ai/DeepEP) | [#612](https://github.com/deepseek-ai/DeepEP/pull/612) | OPEN, mergeable | Base substrate (all frameworks) |
+| [vllm-project/vllm](https://github.com/vllm-project/vllm) | [#41183](https://github.com/vllm-project/vllm/pull/41183) | OPEN, mergeable | Inference (this repo) |
+| [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) | [#4632](https://github.com/NVIDIA/Megatron-LM/pull/4632) | OPEN, mergeable | Training (sibling repo) |
+| [NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) | [#2410](https://github.com/NVIDIA-NeMo/RL/pull/2410) / [#2411](https://github.com/NVIDIA-NeMo/RL/pull/2411) | OPEN, mergeable | Training (sibling repo) |
+| [sgl-project/sglang](https://github.com/sgl-project/sglang) | [#24443](https://github.com/sgl-project/sglang/pull/24443) | OPEN, mergeable | Inference (this repo) |
 
 This repo consumes DeepEP PR #612 as `patches/0001-0003` and vLLM PR #41183 via fork pin. When both PRs merge upstream, this repo's build chain reduces to vanilla clones with no patches. See `docs/UPSTREAM-STATUS.md` for live tracking.
 
@@ -95,7 +99,7 @@ from GHCR, ~10 min) or the offline-reproducible from-vanilla path
 git clone https://github.com/antonai-work/vllm-deepep-v2-efa
 cd vllm-deepep-v2-efa
 
-# Fast (default): FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+# Fast (default): FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a
 docker/build.sh --mode fast    vllm-deepep-v2-efa:fast
 
 # From vanilla: FROM nvidia/cuda:12.9.0-devel-ubuntu24.04, no GHCR dep
