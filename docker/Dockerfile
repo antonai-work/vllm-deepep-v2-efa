@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # Dual-path build:
-#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
 #                         (Wave-1 published base image, same DeepEP V2 + EFA
 #                          stack as below, skips the 40 minute cold build)
 #   BUILD_MODE=vanilla -> inlines the full 240 line base stack from
@@ -49,7 +49,7 @@
 # =============================================================================
 
 ARG BUILD_MODE=fast
-ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.0-sm90a
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.1.1-sm90a
 ARG BASE_IMAGE_VANILLA=nvidia/cuda:12.9.0-devel-ubuntu24.04
 
 # =============================================================================
