@@ -80,7 +80,7 @@ phases:
       # dmvevents/DeepEP-1@aws-efa-auto-qp-cap-v2 or a CUDA-runtime unification
       # only needs to touch one file per consumer repo. Dockerfile retains
       # hardcoded ARG defaults as fallback.
-      - test -f pins.env || (echo "ERROR: pins.env missing at repo root" && exit 2)
+      - 'test -f pins.env || (echo "ERROR: pins.env missing at repo root" && exit 2)'
       - . ./pins.env
       - echo "[pre_build] pins.env DEEPEP_FORK=${DEEPEP_FORK:-<unset>}"
       - echo "[pre_build] pins.env DEEPEP_BRANCH=${DEEPEP_BRANCH:-<unset>}"
