@@ -371,44 +371,18 @@ RUN set -eux; \
     python3 -c "import deep_gemm; print('deep_gemm OK:', deep_gemm.__file__)" 2>&1 \
       || echo "deep_gemm not importable; documented fallback applies"
 
-# Realign torch + deep_ep ABI after vLLM's VLLM_USE_PRECOMPILED=1 install,
-# which can pull a cu130 torch wheel (default on pytorch.org) and clobber
-# the cu129 torch + nvidia-nccl-cu13 2.30.4 symlink the base layer set up.
-#
-# The base image (BUILD_MODE=fast) already ships torch 2.9.1+cu129 AND a
-# deep_ep 146cc356 editable install built against it. If vLLM's precompiled
-# install kept torch==cu129 (common because the vLLM wheel is pinned), the
-# deep_ep rebuild is a pure waste that can fail if transient deps shifted
-# (Wave 7c.1 symptom: nvcc fails under the reinstalled torch+cu129 combo).
-#
-# Strategy: only rebuild if torch version actually drifted away from
-# cu129. A matching torch means the base image's deep_ep .so is still
-# valid.
+# -----------------------------------------------------------------------------
+# Wave 7c.3 — force torch to cu129 AFTER vLLM install so its transitive
+# cu130 torch (if any) is overridden. Base image's deep_ep 146cc356 is
+# compiled against cu129 torch, so the .so is ABI-compatible once torch is
+# cu129. No deep_ep rebuild needed.
+# -----------------------------------------------------------------------------
 RUN set -eux; \
-    CURRENT_TORCH="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo MISSING)"; \
-    echo "post-vLLM torch: ${CURRENT_TORCH}"; \
-    if [[ "${CURRENT_TORCH}" == *"+cu129"* ]]; then \
-      echo "torch is already cu129; skipping force-reinstall + deep_ep rebuild"; \
-      echo "(base image's deep_ep 146cc356 .so is ABI-compatible with current torch)"; \
-    else \
-      echo "torch drifted to ${CURRENT_TORCH}; realigning to cu129 + rebuilding deep_ep"; \
-      pip uninstall -y --break-system-packages nvidia-nccl-cu12 || true; \
-      pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
-        "nvidia-nccl-cu13>=2.30.4"; \
-      pip install --no-cache-dir --break-system-packages --force-reinstall \
-        --index-url https://download.pytorch.org/whl/cu129 \
-        torch; \
-      NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
-      test -n "${NCCL_LIB}"; \
-      SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
-      ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
-      ldconfig; \
-      cd /opt/DeepEP; \
-      export LIBRARY_PATH="${NCCL_LIB}:${LIBRARY_PATH:-}"; \
-      export TORCH_CUDA_ARCH_LIST="9.0"; \
-      export MAX_JOBS="$(nproc)"; \
-      pip install --no-build-isolation --break-system-packages --force-reinstall --no-deps -e .; \
-    fi; \
+    pip install --no-cache-dir --break-system-packages --force-reinstall \
+      --index-url https://download.pytorch.org/whl/cu129 \
+      torch; \
+    python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
+    python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
     # rather than `import`, because a full import pulls in transformers ->
@@ -418,8 +392,7 @@ RUN set -eux; \
     python3 -c "from vllm.utils.import_utils import has_deep_ep_v2; print('has_deep_ep_v2 symbol OK')"; \
     grep -q '^class DeepEPV2PrepareAndFinalize' \
       /opt/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py \
-      && echo 'DeepEPV2PrepareAndFinalize class present in source'; \
-    python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"
+      && echo 'DeepEPV2PrepareAndFinalize class present in source'
 
 # -----------------------------------------------------------------------------
 # NO-SHIM INVARIANT: this image explicitly has no /opt/api-shim and no
