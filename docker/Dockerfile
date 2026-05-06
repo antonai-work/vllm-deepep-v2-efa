@@ -392,12 +392,21 @@ RUN set -eux; \
       --index-url https://download.pytorch.org/whl/cu129 \
       torch; \
     python3 -c "import torch; assert '+cu129' in torch.__version__, torch.__version__; print('torch realigned to cu129:', torch.__version__)"; \
-    # HISTORICAL: Wave 7c.4 previously inserted a cu13 realign cascade here (pip
-    # remove cu12, pip install cu13 wheel, relink libnccl.so). Wave 8 live-cluster
-    # validation proved that cascade caused "invalid device ordinal" at first MoE
-    # dispatch because torch cu129 is a cu12.9 build, not a cu13 build. Wave 9b
-    # removes the realign entirely: base image v0.1.2-sm90a now ships cu12 NCCL
-    # natively, so torch + DeepEP _C.so + NCCL all agree on cu12 throughout.
+    # Wave 9b: the torch cu129 2.11.0 wheel pins `nvidia-nccl-cu12==2.28.9`, which
+    # gets downgraded by `--force-reinstall` even though the base image ships
+    # 2.30.4. DeepEP V2 _C.so was compiled against 2.30+ symbols
+    # (`ncclCommQueryProperties`), so we re-upgrade NCCL to 2.30.4 (cu12) after
+    # torch. This preserves cu12 unification across the whole stack - no cu13
+    # anywhere. HISTORICAL: Wave 7c.4 did the same thing but with a cu13 wheel,
+    # causing Wave 8 "invalid device ordinal" crashes because torch cu129 is a
+    # cu12.9 build, not a cu13 build.
+    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+      "${NVIDIA_NCCL_PIN}"; \
+    NCCL_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nccl/lib' -type d 2>/dev/null | head -1)"; \
+    test -n "${NCCL_LIB}"; \
+    SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
+    ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
+    ldconfig; \
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
