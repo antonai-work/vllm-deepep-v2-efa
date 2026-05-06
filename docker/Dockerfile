@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # Dual-path build:
-#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a
+#   BUILD_MODE=fast    -> FROM ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.2-sm90a
 #                         (Wave 13 cu13-native base, same DeepEP V2 + EFA
 #                          stack as below, skips the 40 minute cold build)
 #   BUILD_MODE=vanilla -> inlines the full 240 line base stack from
@@ -52,9 +52,9 @@
 # =============================================================================
 
 ARG BUILD_MODE=fast
-ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.1-sm90a
+ARG BASE_IMAGE_FAST=ghcr.io/antonai-work/deepep-v2-efa-base:v0.2.2-sm90a
 ARG BASE_IMAGE_VANILLA=nvidia/cuda:13.0.0-devel-ubuntu24.04
-# Wave 13 cu13 cascade: single cu13 NCCL throughout. Base image v0.2.1-sm90a is
+# Wave 13 cu13 cascade: single cu13 NCCL throughout. Base image v0.2.2-sm90a is
 # a cu13-native rebuild, so torch cu130 + nvidia-nccl-cu13 + DeepEP _C.so all
 # share libcudart.so.13. Supersedes Wave 9b cu12 unification which broke on
 # Wave 11 with `invalid device ordinal` due to residual torch/vllm._C cu13
@@ -353,7 +353,7 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # G1 (Wave 6 fix, Wave 13 cu13 cascade): ensure torchvision matches base cu13.
 # vLLM's VLLM_USE_PRECOMPILED=1 install pulls a torch+torchvision pair whose
-# torchvision is linked against CUDA 13 shared libs. Base image v0.2.1-sm90a
+# torchvision is linked against CUDA 13 shared libs. Base image v0.2.2-sm90a
 # is nvidia/cuda:13.0.0-devel-ubuntu24.04 with libcudart.so.13 native, so we
 # realign torchvision to the cu130 index to guarantee ABI match. (Under
 # <=Wave 11 this step realigned to cu129 to match the old CUDA 12.9 base;
@@ -395,7 +395,7 @@ RUN set -eux; \
 # vLLM VLLM_USE_PRECOMPILED=1 already installs torch cu130 by default now, but
 # --force-reinstall pins the index-url to cu130 as belt-and-suspenders. The
 # ABI chain is now: base libcudart.so.13 -> torch cu130 -> vllm._C cu13 ->
-# deep_ep _C.so (built against torch cu130 in base v0.2.1-sm90a) ->
+# deep_ep _C.so (built against torch cu130 in base v0.2.2-sm90a) ->
 # nvidia-nccl-cu13 2.30.4. NO cu12 anywhere.
 #
 # HISTORICAL: Wave 7c.3 pinned torch to cu129 + Wave 9b pinned NCCL to
@@ -422,7 +422,7 @@ RUN set -eux; \
     ldconfig; \
     # Wave 13 NVSHMEM guard: torch cu130 / vLLM precompiled wheel pins
     # nvidia-nvshmem-cu13==3.4.5 and downgrades the base image's 3.6.5.
-    # DeepEP V2 _C.so in v0.2.1-sm90a was linked against NVSHMEM 3.6.x
+    # DeepEP V2 _C.so in v0.2.2-sm90a was linked against NVSHMEM 3.6.x
     # (symbol `nvshmem_selected_device_transport, version NVSHMEM` was
     # added in 3.6). Reinstall >= 3.6.0 after torch/vLLM to restore the
     # base ABI and re-link the unversioned libnvshmem_host.so symlink.
