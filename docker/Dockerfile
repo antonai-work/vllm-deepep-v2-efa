@@ -420,6 +420,19 @@ RUN set -eux; \
     SO2="$(ls "${NCCL_LIB}"/libnccl.so.* 2>/dev/null | head -1)"; \
     ln -sf "$(basename "${SO2}")" "${NCCL_LIB}/libnccl.so"; \
     ldconfig; \
+    # Wave 13 NVSHMEM guard: torch cu130 / vLLM precompiled wheel pins
+    # nvidia-nvshmem-cu13==3.4.5 and downgrades the base image's 3.6.5.
+    # DeepEP V2 _C.so in v0.2.1-sm90a was linked against NVSHMEM 3.6.x
+    # (symbol `nvshmem_selected_device_transport, version NVSHMEM` was
+    # added in 3.6). Reinstall >= 3.6.0 after torch/vLLM to restore the
+    # base ABI and re-link the unversioned libnvshmem_host.so symlink.
+    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+      "nvidia-nvshmem-cu13>=3.6.0"; \
+    NVSHMEM_LIB="$(find /usr/local/lib /usr/lib -path '*/nvidia/nvshmem/lib' -type d 2>/dev/null | head -1)"; \
+    test -n "${NVSHMEM_LIB}"; \
+    HOST_SO="$(ls "${NVSHMEM_LIB}"/libnvshmem_host.so.* | head -1)"; \
+    ln -sf "$(basename "${HOST_SO}")" "${NVSHMEM_LIB}/libnvshmem_host.so"; \
+    ldconfig; \
     python3 -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer'); print('deep_ep.ElasticBuffer OK')"; \
     # Sanity checks for PR #41183 symbols.
     # The vllm.model_executor probe is done via `grep` of the source file
